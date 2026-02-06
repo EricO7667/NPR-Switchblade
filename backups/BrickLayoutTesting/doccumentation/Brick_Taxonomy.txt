@@ -1,0 +1,265 @@
+====================================================================
+NPR SWITCHBLADE — BRICK TAXONOMY & AUTHORING RULES
+====================================================================
+Purpose:
+--------
+This document defines the TYPES of bricks allowed in the NPR
+Switchblade pipeline and the strict rules governing their behavior.
+
+Its goal is to:
+- Prevent bricks from becoming overloaded
+- Eliminate configuration-flag creep
+- Keep pipelines understandable at scale
+- Ensure long-term maintainability
+
+This is a DISCIPLINE document, not a framework.
+
+====================================================================
+1. WHAT A BRICK IS
+====================================================================
+
+A brick is a single, composable pipeline unit that:
+
+- Receives a Payload
+- TRUSTS the incoming schema
+- Performs one logical responsibility
+- Emits a NEW Payload with a new schema
+
+Bricks do NOT:
+- Maintain global state
+- Reach outside the pipeline
+- Perform multiple unrelated responsibilities
+
+====================================================================
+2. BRICK TAXONOMY (AUTHORITATIVE)
+====================================================================
+
+Every brick MUST fall into exactly ONE of the following categories.
+
+If it does not, it must be split.
+
+------------------------------------------------------------
+2.1 SOURCE BRICKS
+------------------------------------------------------------
+
+Purpose:
+- Introduce data into the pipeline
+
+Examples:
+- importer_excel
+- importer_csv
+- importer_api
+
+Allowed:
+- File I/O
+- API calls
+- Raw data loading
+- Minimal normalization (e.g. NaN → "")
+
+Must NOT:
+- Parse component meaning
+- Match inventory
+- Classify parts
+- Contain business logic
+
+Output:
+- Typically emits schema: raw_*
+
+
+------------------------------------------------------------
+2.2 TRANSFORM BRICKS
+------------------------------------------------------------
+
+Purpose:
+- Structural or syntactic transformation of data
+
+Examples:
+- resolver_headers
+- column_normalizer
+- unit_standardizer
+
+Allowed:
+- Renaming columns
+- Cleaning strings
+- Reshaping records
+
+Must NOT:
+- Interpret engineering meaning
+- Add derived electrical values
+- Perform matching logic
+
+Output:
+- Emits structurally cleaner schemas (e.g. normalized)
+
+
+------------------------------------------------------------
+2.3 ENRICH BRICKS
+------------------------------------------------------------
+
+Purpose:
+- Add derived or interpreted information to rows
+
+Examples:
+- parser_enrich
+- package_identifier
+- value_parser
+
+Allowed:
+- Parsing descriptions
+- Extracting electrical attributes
+- Adding warnings or notes
+
+Must NOT:
+- Make decisions about inventory matches
+- Drop rows silently
+- Format for reporting
+
+Output:
+- Emits semantically richer schemas (e.g. parsed_parts)
+
+
+------------------------------------------------------------
+2.4 ANALYZE BRICKS
+------------------------------------------------------------
+
+Purpose:
+- Evaluate, compare, or classify data
+
+Examples:
+- matcher_crosscheck
+- confidence_scorer
+- duplicate_detector
+
+Allowed:
+- Compare NPR vs inventory
+- Assign match classifications
+- Compute scores
+
+Must NOT:
+- Modify parsed attributes
+- Perform formatting or exporting
+- Perform I/O
+
+Output:
+- Emits decision-bearing schemas (e.g. matched_results)
+
+
+------------------------------------------------------------
+2.5 EMIT BRICKS
+------------------------------------------------------------
+
+Purpose:
+- Produce output artifacts
+
+Examples:
+- report_generator
+- csv_exporter
+- snapshot_exporter
+
+Allowed:
+- Writing files
+- Formatting output
+- UI display hooks
+
+Must NOT:
+- Modify semantic data
+- Reclassify parts
+- Perform matching or parsing
+
+Output:
+- Typically terminal schemas (e.g. report_ready)
+
+====================================================================
+3. HARD RULES (NON-NEGOTIABLE)
+====================================================================
+
+RULE 1 — ONE RESPONSIBILITY
+---------------------------
+If a brick needs to do two conceptually different things,
+it must be split into two bricks.
+
+RULE 2 — NO MODE FLAGS
+----------------------
+If a brick requires a config flag like:
+    mode: inventory
+    mode: bom
+    strict: true
+
+That brick is doing too much and must be split.
+
+RULE 3 — TRUST THE SCHEMA
+-------------------------
+Bricks must trust the incoming schema.
+No defensive programming for guaranteed fields.
+
+If a guarantee is violated, the bug is upstream.
+
+RULE 4 — NO SILENT DATA LOSS
+----------------------------
+Bricks must not silently drop rows.
+Any dropped or altered rows must be recorded in metadata.
+
+RULE 5 — NO BUSINESS LOGIC IN SOURCE OR TRANSFORM BRICKS
+---------------------------------------------------------
+Interpretation belongs ONLY in Enrich or Analyze bricks.
+
+====================================================================
+4. CONFIGURATION GUIDELINES
+====================================================================
+
+Brick config should:
+- Control parameters, not behavior modes
+- Be small and explicit
+- Never change the brick’s responsibility
+
+Good config:
+- thresholds
+- file paths
+- column names
+
+Bad config:
+- mode switches
+- behavior toggles
+- multi-purpose flags
+
+====================================================================
+5. WHEN TO SPLIT A BRICK (CHECKLIST)
+====================================================================
+
+Split a brick if ANY of the following are true:
+
+- It needs an if/else for behavior modes
+- It produces different schemas depending on config
+- It touches both parsing and matching logic
+- It reads and writes files
+- It requires more than one schema contract to explain
+
+====================================================================
+6. WHY THIS MATTERS
+====================================================================
+
+Without these rules:
+- Bricks grow unchecked
+- Pipelines become fragile
+- Refactors become expensive
+- Debugging becomes archaeology
+
+With these rules:
+- Pipelines scale linearly
+- Bricks remain replaceable
+- Schemas stay meaningful
+- Development stays fast
+
+====================================================================
+7. AUTHORITATIVE SUMMARY
+====================================================================
+
+Schemas define what data looks like.
+Bricks define how data changes.
+Brick types define what a brick is allowed to do.
+
+Violating these boundaries creates technical debt.
+
+====================================================================
+END OF DOCUMENT
+====================================================================

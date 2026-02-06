@@ -1,0 +1,117 @@
+version: 1
+
+# =========================================================
+# COMPONENT TYPES
+# =========================================================
+# This defines WHAT exists in the system.
+# No code changes are required to add a new type.
+components:
+  RES:
+    enabled: true
+    detect_keywords:
+      - RES
+      - RESISTOR
+      - OHM
+      - Ω
+
+    parsing:
+      value: resistance_ohms
+      tolerance: percent
+      package: standard
+      mount: auto
+
+    matching:
+      confidence_scale: 1.0
+      rules:
+        - field: value
+          mode: eq
+        - field: tolerance
+          mode: max        # inventory <= requested
+        - field: package
+          mode: eq
+        - field: mount
+          mode: eq
+
+  CAP:
+    enabled: true
+    detect_keywords:
+      - CAP
+      - CAPACITOR
+      - UF
+      - NF
+      - PF
+      - FARAD
+
+    parsing:
+      value: capacitance_farads
+      voltage: volts
+      tolerance: percent
+      dielectric: keyword
+      package: standard
+      mount: auto
+
+    matching:
+      confidence_scale: 1.0
+      rules:
+        - field: value
+          mode: eq
+        - field: voltage
+          mode: eq        # inventory = requested
+        - field: tolerance
+          mode: max
+        - field: dielectric
+          mode: eq
+        - field: package
+          mode: eq
+        - field: mount
+          mode: eq
+
+  LED:
+    enabled: true
+    detect_keywords:
+      - LED
+
+    parsing:
+      color: keyword
+      brightness_mcd: numeric
+      wavelength_nm: numeric
+      package: standard
+      mount: auto
+
+    matching:
+      confidence_scale: 0.9
+      rules:
+        - field: color
+          mode: eq
+        - field: brightness_mcd
+          mode: range
+          tolerance: 0.20
+        - field: package
+          mode: eq
+        - field: mount
+          mode: eq
+
+# =========================================================
+# MATCH TIERS (GLOBAL)
+# =========================================================
+tiers:
+  EXACT_MFG_PN:
+    confidence: 1.00
+
+  PREFIX_FAMILY:
+    confidence: 0.60
+
+  EXACT_ITEMNUM:
+    confidence: 0.85
+
+  SUBSTITUTE:
+    confidence: 1.00
+
+  PARSED_MATCH:
+    confidence: 0.75
+
+  API_ASSISTED:
+    confidence: 0.55
+
+  NO_MATCH:
+    confidence: 0.00

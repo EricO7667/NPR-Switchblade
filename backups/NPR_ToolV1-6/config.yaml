@@ -1,0 +1,32 @@
+# ==========================================
+# PARSING RULES
+# ==========================================
+parsing_rules:
+  RES: ["res", "ohm"]
+  CAP: ["cap", "farad", "uf", "nf", "pf"]
+  LED: ["led"]
+  DIODE: ["diode"]
+  TRANSISTOR: ["transistor", "bjt"]
+  MOSFET: ["mosfet"]
+  TRIAC: ["triac"]
+
+# ==========================================
+# MATCHING RULES
+# ==========================================
+matching_rules:
+  default:
+    match_by:
+      - ["type", "type"]
+      - ["value", "value"]
+    link_field: "inventory_match"
+
+  RES:
+    match_by:
+      - ["type", "type"]
+      - ["value", "value"]
+      - ["tolerance", "tolerance"]
+
+  CAP:
+    match_by:
+      - ["type", "type"]
+      - ["value", "value"]

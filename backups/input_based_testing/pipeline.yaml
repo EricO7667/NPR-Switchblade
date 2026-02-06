@@ -1,0 +1,10 @@
+pipeline:
+  - name: LoadBOM
+    rules:
+      - type: "load_bom"
+        path: "./input/fake_bom.xlsx"
+
+  - name: ParseDescriptions
+    rules:
+      - type: "parse"
+        rules_file: "C:\PersonalProjects\PartChecker\input_based_testing\rules\parsing_rules.yaml"

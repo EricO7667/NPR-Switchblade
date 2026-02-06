@@ -1,0 +1,245 @@
+====================================================================
+NPR SWITCHBLADE — STEP 4
+METADATA DISCIPLINE & OBSERVABILITY
+====================================================================
+Purpose:
+--------
+This document defines how METADATA is structured, owned, and used in
+the NPR Switchblade pipeline.
+
+Its goal is to:
+- Prevent metadata from becoming a junk drawer
+- Preserve debuggability at scale
+- Enable traceability and observability
+- Support future tooling without refactors
+
+Metadata is INFORMATIONAL, not OPERATIONAL.
+
+====================================================================
+1. WHAT METADATA IS (AND IS NOT)
+====================================================================
+
+Metadata is contextual information ABOUT the payload, not part of the
+payload’s semantic data.
+
+Metadata exists to answer questions like:
+- Where did this data come from?
+- What happened to it?
+- How long did it take?
+- What warnings occurred?
+
+Metadata is NOT:
+- A place to store core business data
+- A replacement for structured fields
+- A decision-making mechanism inside engines
+
+====================================================================
+2. METADATA MUST BE NAMESPACED
+====================================================================
+
+All metadata MUST live under a clear namespace.
+
+Flat metadata dictionaries are forbidden.
+
+Recommended top-level namespaces:
+
+- runner
+- brick
+- source
+- transform
+- enrich
+- analyze
+- emit
+- warnings
+- diagnostics
+
+Example:
+
+metadata:
+  runner:
+    step_index: 3
+    brick_name: matcher_crosscheck
+    duration_sec: 0.142
+    timestamp: 2025-12-17T21:03:11Z
+
+  source:
+    path: ./data/bom.xlsx
+    rows: 512
+
+  analyze:
+    match_rate: 0.78
+
+====================================================================
+3. METADATA OWNERSHIP RULES
+====================================================================
+
+------------------------------------------------------------
+3.1 Runner-Owned Metadata
+------------------------------------------------------------
+
+Only the Runner may write to the `runner` namespace.
+
+Includes:
+- step_index
+- brick_name
+- schema_before
+- schema_after
+- duration
+- timestamps
+- run identifiers
+
+Bricks must NEVER modify runner metadata.
+
+------------------------------------------------------------
+3.2 Brick-Owned Metadata
+------------------------------------------------------------
+
+Bricks may write ONLY to namespaces matching their brick type.
+
+Examples:
+- Source brick → source
+- Transform brick → transform
+- Enrich brick → enrich
+- Analyze brick → analyze
+- Emit brick → emit
+
+Bricks must NOT write to:
+- runner
+- source (unless source brick)
+- other brick namespaces
+
+------------------------------------------------------------
+3.3 Warning Metadata
+------------------------------------------------------------
+
+Warnings must live under:
+
+metadata:
+  warnings:
+    - message
+    - severity
+    - row_reference (optional)
+
+Warnings must NEVER:
+- Be silently dropped
+- Be embedded in core data fields
+
+====================================================================
+4. WHAT BELONGS IN METADATA VS DATA
+====================================================================
+
+------------------------------------------------------------
+BELONGS IN DATA
+------------------------------------------------------------
+
+- Parsed electrical values
+- Match classifications
+- Confidence scores
+- Part attributes
+- Inventory references
+
+------------------------------------------------------------
+BELONGS IN METADATA
+------------------------------------------------------------
+
+- Row counts
+- Performance metrics
+- Source paths
+- Column mappings
+- Dropped row counts
+- Warning summaries
+- Diagnostics
+
+Rule of Thumb:
+If downstream logic depends on it → it belongs in DATA, not metadata.
+
+====================================================================
+5. OBSERVABILITY GOALS
+====================================================================
+
+Metadata should allow a developer to answer the following without
+rerunning the pipeline:
+
+- What brick produced this output?
+- What schema transitions occurred?
+- How long did each step take?
+- Where did the input originate?
+- Were any warnings generated?
+
+Snapshots + metadata should tell the full story.
+
+====================================================================
+6. SNAPSHOT DESIGN INTENT
+====================================================================
+
+Snapshots are NOT backups.
+Snapshots are NOT full datasets.
+
+Snapshots are:
+- Debug artifacts
+- Reproducibility anchors
+- Human-readable checkpoints
+
+Each snapshot should include:
+- schema
+- namespaced metadata
+- data preview (truncated)
+
+Snapshots should be:
+- Small
+- Numerous
+- Disposable
+
+====================================================================
+7. METADATA EVOLUTION RULES
+====================================================================
+
+- Metadata keys may be added freely
+- Metadata keys should rarely be removed
+- Meaning of existing keys must not change
+- Namespaces are stable contracts
+
+If a metadata key starts being relied on by logic:
+→ It must move into DATA.
+
+====================================================================
+8. ANTI-PATTERNS (FORBIDDEN)
+====================================================================
+
+- Flat metadata dictionaries
+- Overwriting metadata silently
+- Using metadata for control flow
+- Storing parsed values in metadata
+- Brick writing into another brick’s namespace
+
+====================================================================
+9. WHY THIS MATTERS
+====================================================================
+
+Without discipline:
+- Metadata becomes untrustworthy
+- Debugging becomes guesswork
+- Snapshots lose value
+- Observability collapses
+
+With discipline:
+- Pipelines are explainable
+- Bugs are traceable
+- Performance issues are visible
+- Future tooling is easy
+
+====================================================================
+10. AUTHORITATIVE SUMMARY
+====================================================================
+
+Metadata tells the story of the pipeline.
+Data is the result of the pipeline.
+
+Metadata is namespaced, owned, and observational.
+Data is semantic and authoritative.
+
+Never confuse the two.
+
+====================================================================
+END OF DOCUMENT
+====================================================================

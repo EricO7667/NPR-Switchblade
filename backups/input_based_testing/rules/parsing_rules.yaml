@@ -1,0 +1,10 @@
+parsing_rules:
+  - name: resistor
+    detect: ["contains:RES", "contains:Ω"]
+    extract: ["ohmic_value", "tolerance"]
+    tag: "resistor"
+
+  - name: capacitor
+    detect: ["contains:CAP", "contains:F"]
+    extract: ["cap_value", "voltage"]
+    tag: "capacitor"

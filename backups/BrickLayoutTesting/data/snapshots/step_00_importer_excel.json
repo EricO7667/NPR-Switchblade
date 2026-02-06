@@ -1,0 +1,20 @@
+{
+  "schema": "raw_excel",
+  "metadata": {
+    "user": "tester",
+    "environment": "local",
+    "source": "./data/test2.xlsx",
+    "rows": 43,
+    "columns": [
+      "Item Description",
+      "Manufacturer Part #"
+    ],
+    "step_index": 0,
+    "brick_name": "importer_excel",
+    "schema_before": "empty",
+    "schema_after": "raw_excel",
+    "duration_sec": 1.92,
+    "timestamp": "2025-12-16T09:34:36.013534"
+  },
+  "preview": "[{'Item Description': 'CAP,SM,CER,100NF,100V,10%,X7R,0603', 'Manufacturer Part #': 'CC0603KRX7R0BB104'}, {'Item Description': 'CAP,SM,CER,100NF,25V,10%,X7R,0603', 'Manufacturer Part #': 'CC0603KRX7R8BB104'}, {'Item Description': 'CAP,SM,CER,1.5PF,100V,0.1PF,C0G,0402', 'Manufacturer Part #': 'CBR04C159B1GAC'}, {'Item Description': 'CAP,SM,CER,680PF,50V,10%,X7R,0402', 'Manufacturer Part #': 'CC0402KPX7R9BB681'}, {'Item Description': 'CAP,SM,CER,56NF,10V,10%,X7R,0402', 'Manufacturer Part #': 'CC040"
+}

@@ -1,0 +1,236 @@
+====================================================================
+NPR SWITCHBLADE — STEP 3
+DATA MODELS & ENGINE BOUNDARIES
+====================================================================
+Purpose:
+--------
+This document defines when raw dictionaries are no longer sufficient,
+introduces OPTIONAL structured data models, and establishes strict
+boundaries between BRICKS and ENGINES.
+
+The goal is to:
+- Prevent logic duplication
+- Improve reasoning and tooling
+- Keep bricks thin and disposable
+- Avoid turning the system into a framework
+
+This step is OPTIONAL-BY-DESIGN and GRADUAL.
+
+====================================================================
+1. CORE PRINCIPLE
+====================================================================
+
+Payloads may carry EITHER:
+- Raw dictionaries
+- Structured data models
+- A mixture of both
+
+Schemas do NOT require data models.
+Engines MAY require data models.
+
+This is a HYBRID system.
+
+====================================================================
+2. WHAT A DATA MODEL IS
+====================================================================
+
+A data model is a lightweight, structured representation of a domain
+concept.
+
+Examples:
+- ParsedPart
+- InventoryPart
+- MatchResult
+
+Data models:
+- Represent meaning, not process
+- Contain data, not logic
+- Are optional, not mandatory
+
+Data models do NOT:
+- Perform parsing
+- Perform matching
+- Know about schemas
+- Know about payloads
+
+====================================================================
+3. WHEN TO INTRODUCE A DATA MODEL
+====================================================================
+
+Introduce a data model ONLY if one or more of the following are true:
+
+- A concept appears in multiple bricks
+- Multiple fields must exist together to be meaningful
+- Engines require stable field access
+- Defensive checks are spreading
+- IDE autocomplete would materially help
+
+If none of the above apply, continue using dicts.
+
+====================================================================
+4. RECOMMENDED INITIAL DATA MODELS
+====================================================================
+
+------------------------------------------------------------
+4.1 ParsedPart
+------------------------------------------------------------
+
+Represents a fully parsed component from an NPR or BOM.
+
+Required fields:
+- part_type
+- description
+
+Common optional fields:
+- resistance_ohms
+- capacitance_f
+- inductance_h
+- tolerance_percent
+- voltage_rating
+- power_watts
+- package
+- parsing_warnings
+
+Notes:
+- Not all fields apply to all part types
+- Presence of fields is governed by schema contracts
+- ParsedPart does not validate itself
+
+------------------------------------------------------------
+4.2 InventoryPart (Future)
+------------------------------------------------------------
+
+Represents a canonical inventory record.
+
+Typical fields:
+- item_number
+- manufacturer
+- manufacturer_part_number
+- description
+- approved_status
+
+------------------------------------------------------------
+4.3 MatchResult
+------------------------------------------------------------
+
+Represents the outcome of comparing a ParsedPart against inventory.
+
+Fields:
+- match_type (exact / equivalent / none)
+- matched_item_number
+- matched_mfg_pn
+- confidence_score
+- match_notes
+
+====================================================================
+5. ENGINE BOUNDARIES (CRITICAL)
+====================================================================
+
+An ENGINE is where logic lives.
+
+Examples:
+- ParsingEngine
+- MatchingEngine
+- ScoringEngine
+
+Engines:
+- Accept raw dicts OR data models
+- Return data models or enriched structures
+- Contain business logic
+- Are testable in isolation
+
+Engines do NOT:
+- Know about Payloads
+- Know about schemas
+- Perform I/O
+- Write files
+- Handle UI
+
+====================================================================
+6. BRICK VS ENGINE RESPONSIBILITIES
+====================================================================
+
+------------------------------------------------------------
+BRICKS
+------------------------------------------------------------
+- Orchestrate
+- Call engines
+- Trust schemas
+- Package results into Payloads
+- Emit schema transitions
+
+------------------------------------------------------------
+ENGINES
+------------------------------------------------------------
+- Parse meaning
+- Apply rules
+- Compare data
+- Compute results
+- Encapsulate complexity
+
+If logic grows:
+- Move it INTO an engine
+- Keep the brick thin
+
+====================================================================
+7. HOW BRICKS USE ENGINES
+====================================================================
+
+Typical pattern:
+
+1. Brick receives Payload
+2. Brick trusts schema
+3. Brick passes payload.data to engine
+4. Engine returns enriched data
+5. Brick emits new Payload + new schema
+
+Bricks should be:
+- Boring
+- Short
+- Replaceable
+
+====================================================================
+8. HOW THIS PREVENTS WASTED TIME
+====================================================================
+
+Without engines:
+- Logic spreads across bricks
+- Refactors are painful
+- Bugs duplicate
+
+Without data models:
+- Defensive programming spreads
+- IDE help is lost
+- Implicit contracts dominate
+
+With this hybrid approach:
+- You only add structure when it pays off
+- No forced rewrites
+- No premature abstraction
+
+====================================================================
+9. NON-GOALS (EXPLICIT)
+====================================================================
+
+This system does NOT aim to:
+- Fully type the pipeline
+- Enforce runtime validation everywhere
+- Replace schemas with models
+- Become a data processing framework
+
+Simplicity and velocity take priority.
+
+====================================================================
+10. AUTHORITATIVE SUMMARY
+====================================================================
+
+Schemas describe pipeline state.
+Bricks move data between states.
+Engines contain logic.
+Data models represent meaning.
+
+Structure is introduced ONLY when it reduces complexity.
+
+====================================================================
+END OF DOCUMENT
+====================================================================

@@ -1,0 +1,5 @@
+{
+  "model_name": "intfloat/e5-base-v2",
+  "max_seq_length": 128,
+  "preprocess_version": 1
+}

@@ -1,0 +1,85 @@
+"""
+====================================================================
+TRANSFORM BRICK — header_locator
+====================================================================
+
+Purpose:
+--------
+Detect the row that represents column headers in a messy spreadsheet
+and reshape the data so that row becomes the header row.
+====================================================================
+"""
+
+from npr_tool.runner.payload import Payload
+from npr_tool.core.registry import registry
+
+
+@registry.register("header_locator")
+class HeaderLocator:
+    """
+    Transform Brick:
+    Identifies the header row and rebuilds records accordingly.
+    """
+
+    def __init__(self, config: dict):
+        self.max_scan_rows = config.get("max_scan_rows", 25)
+        self.min_non_empty_ratio = config.get("min_non_empty_ratio", 0.5)
+
+    def _score_row(self, row: dict) -> float:
+        values = list(row.values())
+        if not values:
+            return 0.0
+
+        non_empty = [v for v in values if str(v).strip()]
+        non_empty_ratio = len(non_empty) / len(values)
+
+        numeric_like = sum(
+            1 for v in non_empty if str(v).replace(".", "", 1).isdigit()
+        )
+
+        avg_len = sum(len(str(v)) for v in non_empty) / max(len(non_empty), 1)
+
+        score = (
+            non_empty_ratio * 2
+            - (numeric_like / max(len(non_empty), 1))
+            - (avg_len / 50)
+        )
+        return score
+
+    def run(self, payload: Payload) -> Payload:
+        # Expected schema: raw_excel
+        records = payload.data or []
+
+        scan_rows = records[: self.max_scan_rows]
+
+        best_index = 0
+        best_score = float("-inf")
+
+        for idx, row in enumerate(scan_rows):
+            score = self._score_row(row)
+            if score > best_score:
+                best_score = score
+                best_index = idx
+
+        header_row = records[best_index]
+        header_keys = list(header_row.values())
+
+        new_records = []
+        for row in records[best_index + 1 :]:
+            new_row = {
+                str(header_keys[i]).strip(): row.get(k, "")
+                for i, k in enumerate(row.keys())
+                if i < len(header_keys)
+            }
+            new_records.append(new_row)
+
+        return payload.with_update(
+            data=new_records,
+            schema="raw_table",
+            metadata={
+                "transform": {
+                    "header_row_index": best_index,
+                    "dropped_rows_count": best_index,
+                }
+            }
+        )

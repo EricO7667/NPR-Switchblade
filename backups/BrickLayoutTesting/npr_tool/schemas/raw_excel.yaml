@@ -1,0 +1,22 @@
+schema: raw_excel
+
+description: >
+  Raw spreadsheet data loaded from source without interpretation.
+
+guarantees:
+  - payload.data is List[dict]
+  - each dict represents one row
+  - all values are strings or empty strings
+  - original column names are preserved
+
+may_contain:
+  - metadata.source.path
+  - metadata.source.rows
+  - metadata.source.columns
+
+must_not_contain:
+  - parsed electrical attributes
+  - match results
+
+allowed_next:
+  - normalized
