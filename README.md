@@ -1,6 +1,6 @@
 # NPR Switchblade Tool
 
-The **NPR Switchblade Tool** is an internal application built specifically for **Elan industries**.  
+The **NPR Switchblade Tool** is an internal LOCAL MACHINE application built specifically for **Elan industries**.  
 It is tightly coupled to the Elan industries inventory schema and **will not function correctly with external or generic inventory systems**.
 
 The goal of this tool is to make **NPR (New Parts Report)** and **BOM (Bill of Materials)** processing **faster, easier, and more consistent**.
