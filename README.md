@@ -11,7 +11,7 @@ The goal of this tool is to make **NPR (New Parts Report)** and **BOM (Bill of M
 
 ### AI MFGN Workspace Scrubber (Inventory-Based)
 
-To speed up customer BOM validation against the XXXindustries inventory, the tool scrubs **manufacturer part numbers (MFGNs)** and **descriptions** against the internal inventory in a listed workflow.
+To speed up customer BOM validation against the Elan inventory, the tool scrubs **manufacturer part numbers (MFGNs)** and **descriptions** against the internal inventory in a listed workflow.
 
 - Matches are displayed in a **panelized workspace UI**
 - Multiple matches can be returned when an exact MFGN does not exist
