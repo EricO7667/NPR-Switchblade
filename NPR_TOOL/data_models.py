@@ -4,6 +4,132 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 import uuid
 
+# =========================================================
+# NEW CORE DATA MODEL (v2 schema: canonical BOM input + mutable state + inventory_company)
+# =========================================================
+
+@dataclass
+class InvItem:
+    """Item-level purchasing option under a company part (CPN).
+
+    Pricing is item-level; stock is pooled at the CompanyPart level.
+    """
+    mfgname: str = ""
+    mfgid: str = ""
+    mpn: str = ""  # manufacturer part number
+
+    unit_price: Optional[float] = None
+    last_unit_price: Optional[float] = None
+    standard_cost: Optional[float] = None
+    average_cost: Optional[float] = None
+
+    tariff_code: str = ""
+    tariff_rate: Optional[float] = None
+
+    supplier: str = ""
+    lead_time_days: Optional[int] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "mfgname": self.mfgname,
+            "mfgid": self.mfgid,
+            "mpn": self.mpn,
+            "unit_price": self.unit_price,
+            "last_unit_price": self.last_unit_price,
+            "standard_cost": self.standard_cost,
+            "average_cost": self.average_cost,
+            "tariff_code": self.tariff_code,
+            "tariff_rate": self.tariff_rate,
+            "supplier": self.supplier,
+            "lead_time_days": self.lead_time_days,
+            "meta": self.meta,
+        }
+
+
+@dataclass
+class CompanyPart:
+    """Company Part Number (CPN) level inventory record (inventory_company table)."""
+    cpn: str
+    canonical_desc: str = ""
+    stock_total: int = 0
+    alternates: List[InvItem] = field(default_factory=list)
+    raw_fields: Dict[str, Any] = field(default_factory=dict)
+
+    def to_repo_dict(self) -> Dict[str, Any]:
+        return {
+            "cpn": self.cpn,
+            "canonical_desc": self.canonical_desc,
+            "stock_total": int(self.stock_total or 0),
+            "alternates": [a.to_dict() for a in (self.alternates or [])],
+        }
+
+
+@dataclass
+class BomLineInput:
+    """Canonical imported BOM line (bom_line_input)."""
+    input_line_id: int
+    partnum: str = ""
+    description: str = ""
+    qty: Optional[float] = None
+    refdes: str = ""
+    item_type: str = ""
+    mfgname: str = ""
+    mfgpn: str = ""
+    supplier: str = ""
+    raw_json: Dict[str, Any] = field(default_factory=dict)
+
+    def to_repo_dict(self) -> Dict[str, Any]:
+        return {
+            "input_line_id": int(self.input_line_id),
+            "partnum": self.partnum,
+            "description": self.description,
+            "qty": self.qty,
+            "refdes": self.refdes,
+            "item_type": self.item_type,
+            "mfgname": self.mfgname,
+            "mfgpn": self.mfgpn,
+            "supplier": self.supplier,
+            "raw_json": self.raw_json,
+        }
+
+
+@dataclass
+class BomLineState:
+    """Mutable export-ready BOM line (bom_line_state)."""
+    line_id: int
+    cpn: str = ""
+    needs_new_cpn: bool = False
+
+    desc: str = ""
+    qty: Optional[float] = None
+    refdes: str = ""
+    item_type: str = ""
+
+    selected_mfg: str = ""
+    selected_mpn: str = ""
+
+    unit_price: Optional[float] = None
+    ext_price: Optional[float] = None
+
+    supplier: str = ""
+    lead_time_days: Optional[int] = None
+    qc_required: bool = False
+
+    tariff_code: str = ""
+    tariff_rate: Optional[float] = None
+
+    quote_num: str = ""
+    npr_num_used_in: str = ""
+
+    stock_unit: str = ""
+    purchase_unit: str = ""
+    per_unit_qty: Optional[float] = None
+
+    notes: str = ""
+
+
+
 
 # =========================================================
 # MATCH TYPES ENUM
@@ -52,7 +178,7 @@ class CNSRecord:
     description: str
 
     sheet_name: str = ""
-    category: str = ""          # e.g. "00" .. "99" if you parse it from the sheet name
+    category: str = ""          # e.g. "00" .. "99" 
     date: str = ""
     initials: str = ""
 
@@ -260,7 +386,7 @@ class DecisionNode:
     This is the PRIMARY unit rendered by the UI.
     """
 
-    # ---- Identity ----
+    # ---- Identity ---- 
     id: str                              # stable, immutable
     base_type: str                       # "NEW" | "EXISTS"
 

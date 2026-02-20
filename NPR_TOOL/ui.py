@@ -1,10 +1,10 @@
-# ui/testui.py
+# ui/testui.py in devel
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import traceback
 from typing import Optional
 from .data_models import DecisionNode, DecisionStatus, Alternate
-from .decision_controller import DecisionController
+from .NEW_decision_controller import DecisionController
 import os
 import threading
 
@@ -17,6 +17,8 @@ class DecisionWorkspaceUI:
         self.root.geometry("1500x950")
         self.root.bind_all("<ButtonRelease-1>", self._on_any_mouse_release, add="+")
         self._last_specs_key = None
+
+        self._refreshing_node_table = False
 
 
         # Debug controls (wired to DecisionController via NPR_DEBUG_* env vars)
@@ -113,6 +115,13 @@ class DecisionWorkspaceUI:
             darkcolor=self.COLORS["primary"],
             thickness=14,  # adjust to taste
         )
+
+    def _controller_node_ids(self) -> set[str]:
+        try:
+            return {n.id for n in self.controller.get_nodes()}
+        except Exception:
+            return set()
+
 
     def _no_available_alternates(self, node) -> bool:
         """
@@ -421,6 +430,8 @@ class DecisionWorkspaceUI:
         try:
             n = self.controller.load_inventory(path)
             self.status_var.set(f"Loaded master inventory: {n} unique company parts.")
+            self.current_node = None
+            self.node_tree.selection_remove(self.node_tree.selection())
         except Exception as e:
             messagebox.showerror("Load Master Inventory Failed", str(e))
 
@@ -448,10 +459,11 @@ class DecisionWorkspaceUI:
             if node:
                 node = self.controller.get_node(node.id)
                 self.current_node = node
+                self.current_node = None
+                self.node_tree.selection_remove(self.node_tree.selection())
+
                 self.refresh_node_table()
-                self._render_cards(node)
-                # also refresh specs panel from first internal card
-                self._render_specs_for_node(node)
+                self._reset_selection()
         except Exception as e:
             messagebox.showerror("Load Items Sheet Failed", str(e))
 
@@ -463,6 +475,9 @@ class DecisionWorkspaceUI:
         try:
             n = self.controller.load_npr(path)
             self.status_var.set(f"Loaded BOM/NPR list: {n} parts.")
+            self._reset_selection()
+            #self._render_empty_state("Run matching to generate decisions")
+
         except Exception as e:
             messagebox.showerror("Load BOM Failed", str(e))
 
@@ -491,6 +506,7 @@ class DecisionWorkspaceUI:
     def _on_match_done(self, n):
         #print(f"[UI DBG] controller.run_matching OK -> nodes={n}")
         self.refresh_node_table()
+        self._reset_selection()
         self.status_var.set(f"Matching complete. Built {n} decision nodes.")
 
     def _apply_debug_env(self) -> None:
@@ -1021,25 +1037,13 @@ class DecisionWorkspaceUI:
             lambda e: self.node_tree.yview_scroll(-int(e.delta / 120), "units")
         )
 
-    def refresh_node_table(self):
-        """Redraw table from controller."""
-        self.node_tree.delete(*self.node_tree.get_children())
-
-        for node in self.controller.nodes:
-            self.node_tree.insert(
-                "",
-                "end",
-                iid=node.id,
-                values=(node.id, node.base_type, node.bom_mpn,
-                        node.status, f"{node.confidence*100:.1f}%"),
-            )
-
     def _refresh_detail_for_selected(self):
         """
         Re-render right-side cards + bottom-right specs without changing selection.
         Useful after loading alternates DB.
         """
-        node = getattr(self, "selected_node", None)
+        node = getattr(self, "current_node", None)
+
         if not node:
             return
         try:
@@ -1201,8 +1205,6 @@ class DecisionWorkspaceUI:
 
         self._resize_dirty = False
         self.vpane.bind("<B1-Motion>", lambda e: self._mark_resize_dirty(), add="+")
-
-
 
         # ========== RIGHT SIDE: Detail Panel (framed) ==========
         detail_border = tk.Frame(pane, bg=self.COLORS["card_border"], padx=1, pady=1)
@@ -1531,56 +1533,56 @@ class DecisionWorkspaceUI:
         return specs
 
     def refresh_node_table(self):
-        """Redraw the NPR part node table with appropriate tags and correct winning MPN display."""
-        # Clear all existing items
-        for i in self.node_tree.get_children():
-            self.node_tree.delete(i)
 
-        # Rebuild the table from controller state
-        for node in self.controller.get_nodes():
-            tags = []
+        nodes = list(self.controller.get_nodes())
+        if not nodes:
+            # Nothing selectable exists yet
+            for i in self.node_tree.get_children():
+                self.node_tree.delete(i)
+            return
 
-            # Status-based visual tags
-            if getattr(node, "locked", False):
-                tags.append("locked")
-
-            if node.status == DecisionStatus.NEEDS_ALTERNATE:
-                tags.append("needs_alternate")
-            elif node.status == DecisionStatus.NEEDS_DECISION:
-                tags.append("needs_decision")
-            elif node.status == DecisionStatus.FULL_MATCH:
-                tags.append("full_matched")
-            elif node.status == DecisionStatus.EXISTS:
-                tags.append("exists")
-            elif node.status == DecisionStatus.NEEDS_REVIEW:
-                tags.append("needs_review")
-            elif node.status == DecisionStatus.READY_FOR_EXPORT:
-                tags.append("ready")
-
-            # --- PATCH: Prefer winner or assigned MPN for display ---
-            explain = getattr(node, "explain", {}) or {}
-            winning_mpn = explain.get("winning_mpn", "")
-            display_mpn = (
-                winning_mpn
-                or getattr(node, "assigned_part_number", "")
-                or getattr(node, "internal_part_number", "")
-                or node.bom_mpn
-            )
-
-            # Compute confidence display
-            if len(node.candidate_alternates()) > 0:
-                conf_display = f"{len(node.selected_alternates())}/{len(node.candidate_alternates())}"
-            else:
-                try:
-                    conf_display = f"{node.confidence * 100:.1f}%"
-                except Exception:
-                    conf_display = "—"
-
-            # Debug print for traceability
-            #print(f"[UI TABLE] node={node.id} bom={node.bom_mpn} winning={winning_mpn} display={display_mpn}")
-
-            # --- Insert the row (5 columns total: ID, Type, MPN, Status, Confidence) ---
+        """Redraw the NPR part node table safely (no re-entrant selection crashes)."""
+        self._refreshing_node_table = True
+        try:
+            # Clear selection FIRST
             try:
+                self.node_tree.selection_remove(self.node_tree.selection())
+            except Exception:
+                pass
+
+            # Clear rows
+            for i in self.node_tree.get_children():
+                self.node_tree.delete(i)
+
+            # Rebuild rows
+            for node in self.controller.get_nodes():
+                tags = []
+
+                if getattr(node, "locked", False):
+                    tags.append("locked")
+
+                if node.status == DecisionStatus.NEEDS_ALTERNATE:
+                    tags.append("needs_alternate")
+                elif node.status == DecisionStatus.NEEDS_DECISION:
+                    tags.append("needs_decision")
+                elif node.status == DecisionStatus.FULL_MATCH:
+                    tags.append("full_matched")
+                elif node.status == DecisionStatus.READY_FOR_EXPORT:
+                    tags.append("ready")
+
+                explain = getattr(node, "explain", {}) or {}
+                display_mpn = (
+                    explain.get("winning_mpn")
+                    or getattr(node, "assigned_part_number", "")
+                    or getattr(node, "internal_part_number", "")
+                    or node.bom_mpn
+                )
+
+                if node.candidate_alternates():
+                    conf_display = f"{len(node.selected_alternates())}/{len(node.candidate_alternates())}"
+                else:
+                    conf_display = f"{node.confidence * 100:.1f}%" if node.confidence is not None else "—"
+
                 self.node_tree.insert(
                     "",
                     "end",
@@ -1588,16 +1590,21 @@ class DecisionWorkspaceUI:
                     values=(
                         node.id,
                         node.base_type,
-                        display_mpn,  # ✅ now shows winner if one exists
+                        display_mpn,
                         getattr(node.status, "value", str(node.status)),
                         conf_display,
                     ),
                     tags=tuple(tags),
                 )
-            except Exception as e:
-                print(f"[UI ERROR] Failed to insert node {node.id}: {e}")
+        finally:
+            # IMPORTANT: release guard on next tick, not immediately
+            self.root.after_idle(lambda: setattr(self, "_refreshing_node_table", False))
+
 
     def _render_cards(self, node: DecisionNode):
+        if not node:
+            self._dbg("_render_cards skipped: node is None")
+            return
         self.last_hovered_card = None
         for w in self.cards_inner.winfo_children():
             w.destroy()
@@ -1626,7 +1633,7 @@ class DecisionWorkspaceUI:
         if not winner_mpns and winning_mpn:
             winner_mpns = [winning_mpn.lower()]
 
-        # Collect winner base-itemnums from attempts (new scheme)
+        # Collect winner base-itemnums from attempts 
         winner_itemnums = [
             (a.get("base_itemnum") or a.get("resolved_base_itemnum") or "").strip().lower()
             for a in attempts
@@ -1726,8 +1733,6 @@ class DecisionWorkspaceUI:
             )
             rejected_frame.pack(fill="x", padx=16, pady=(10, 6))
             self._render_card_grid(rejected_frame, rejected_all, node)
-
-    
 
     def _render_card_grid(self, parent, alternates, node, cols=3):
         # Dedicated grid container (NO pack children inside it)
@@ -2065,7 +2070,10 @@ class DecisionWorkspaceUI:
     # WORKSAPCE 
     # ============================================================
     def _open_workspace(self):
+        
         try:
+            self.current_node = None
+            self.node_tree.selection_remove(self.node_tree.selection())
             wss = self.controller.list_workspaces(status="ACTIVE")
             if not wss:
                 messagebox.showinfo("Open Workspace", "No saved workspaces found.")
@@ -2116,12 +2124,15 @@ class DecisionWorkspaceUI:
             btn_row.pack(fill="x", padx=16, pady=(12, 16))
 
             def do_open():
-                ws_id = id_by_display.get(var.get(), "")
-                if not ws_id:
+                selected = (var.get() or '').strip()
+                wsid = id_by_display.get(selected)
+                if not wsid:
+                    messagebox.showwarning('Open Workspace', 'Please select a workspace.')
                     return
-                n = self.controller.open_workspace(ws_id)
+                n = self.controller.open_workspace(wsid)
                 self.refresh_node_table()
-                self.status_var.set(f"Opened workspace '{ws_id}'. Loaded {n} nodes.")
+                self._reset_selection()
+                self.status_var.set(f"Opened workspace '{wsid}'. Loaded {n} nodes.")
                 win.destroy()
 
             tk.Button(
@@ -2175,11 +2186,15 @@ class DecisionWorkspaceUI:
     def _rematch_workspace(self):
         print("[UI DBG] Clicked Re-run Matching (Preserve Decisions)")
         try:
+            self.current_node = None
+            self.node_tree.selection_remove(self.node_tree.selection())
+
             self._apply_debug_env()
             self._show_loading_overlay("Re-running matching (preserving decisions)...")
     
             def run_task():
                 try:
+
                     n = self.controller.rematch_workspace_preserve_decisions()
                     self._safe_after(lambda: self._on_match_done(n))
                 except Exception as e:
@@ -2197,60 +2212,55 @@ class DecisionWorkspaceUI:
     # ============================================================
     # ACTIONS
     # ============================================================
-    #def _on_node_select(self, event):
-    #    selected = self.node_tree.selection()
-    #    if not selected:
-    #        return
-    #    node_id = selected[0]
-    #    node = next((n for n in self.controller.nodes if n.id == node_id), None)
-    #    self.current_node = node
-    #    self._preview_header(node)
-    #    self._render_cards(node)
 
-    def _on_node_select(self, event=None):
-        self._dbg("ENTER _on_node_select")
-
-        selected = self.node_tree.selection()
-        self._dbg(f"selected={selected}")
-
-        if not selected:
-            self._dbg("EXIT _on_node_select (no selection)")
+    def _on_node_select(self, event):
+        sel = self.node_tree.selection()
+        if not sel:
             return
 
-        node_id = selected[0]
-        self._dbg(f"node_id={node_id}")
+        node_id = sel[0]
 
-        node = next((n for n in self.controller.nodes if n.id == node_id), None)
-        self._dbg(f"node lookup result is None? {node is None}")
-
-        if node:
-            self._dbg(
-                f"node.id={node.id} base_type={getattr(node,'base_type',None)} "
-                f"internal_pn={getattr(node,'internal_part_number','')} "
-                f"assigned_pn={getattr(node,'assigned_part_number','')} "
-                f"suggested_pb={getattr(node,'suggested_pb','')}"
-            )
+        # 🔒 HARD GUARD — controller is the source of truth
+        try:
+            node = self.controller.get_node(node_id)
+        except KeyError:
+            # Selection is stale (controller rebuilt nodes)
+            self.node_tree.selection_remove(node_id)
+            self.current_node = None
+            self._clear_detail_panels()
+            return
 
         self.current_node = node
-        self._dbg(f"self.current_node set? {self.current_node is not None}")
+        self._render_header_state(node)
+        self._render_cards(node)
+        self._render_specs_for_node(node)
 
-        # Header + cards
+    def _clear_detail_panels(self):
+        self._update_header_visuals(
+            title="No Selection",
+            desc="",
+            meta="",
+            color="neutral",
+        )
+
         try:
-            self._preview_header(node)
-            self._dbg("_preview_header ok")
-        except Exception as e:
-            self._dbg(f"_preview_header ERROR: {e}")
-            raise
+            self.cards_canvas.delete("all")
+        except Exception:
+            pass
 
         try:
-            self._render_cards(node)
-            self._render_specs_for_node(node)
-            self._dbg("_render_cards ok")
-        except Exception as e:
-            self._dbg(f"_render_cards ERROR: {e}")
-            raise
+            self.specs_tree.delete(*self.specs_tree.get_children())
+        except Exception:
+            pass
 
-        self._dbg("EXIT _on_node_select")
+    def _reset_selection(self):
+        self.current_node = None
+        try:
+            self.node_tree.selection_remove(self.node_tree.selection())
+        except Exception:
+            pass
+
+        self._clear_detail_panels()
 
     def _preview_header(self, node):
         self._dbg("ENTER _preview_header")

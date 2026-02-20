@@ -73,7 +73,7 @@ ENG_FUZZY_TOPK = 250            # how many best fuzzy candidates to keep
 # =====================================================
 # Engineering trace dump (JSONL)
 # =====================================================
-ENG_TRACE_ENABLE = 1
+ENG_TRACE_ENABLE = 0
 ENG_TRACE_PATH = "eng_trace.jsonl"   # relative to cache_dir
 ENG_TRACE_TOPN = 250                 # how many candidates to store per stage (save space or look and gander at everything set to size of ENG_TOPK_PRIMARY)
 
@@ -267,6 +267,7 @@ class MatchingEngine:
             if ENG_DEBUG:
                 print(f"[TRACE] failed to write: {e}")
 
+
     def trace_reset(self) -> None:
         """Call this before a run if you want a clean file."""
         try:
@@ -276,7 +277,7 @@ class MatchingEngine:
         except Exception:
             pass
 
-
+    #outsource Parsing to the parsing engine instead
     def _inv_fingerprint(self) -> str:
         """
         Stable-ish fingerprint for inventory descriptions used to validate caches.
@@ -288,6 +289,8 @@ class MatchingEngine:
             h.update(b"\n")
         return h.hexdigest()
 
+
+    #outsource Parsing to the parsing engine instead
     def _get_or_parse_inv_fields(self, inv: Any) -> dict:
         """
         Try to get parsed fields from the inventory object.
@@ -342,6 +345,9 @@ class MatchingEngine:
         meta_path = self.cache_dir / f"splade_{model_tag}_meta.json"
         return vec_path, meta_path
 
+    #TODO: concern need to address for scope
+    # One concern with this is that the matching engine is now out of scope as well. concern: the matching engine instead of piping data over to the ui for display is making its own data/
+    # perhaps it would be cleaner to launch the the matchinng engine as a process and have it pipe data to the ui so the ui will then handle creation of the loading bar ui.   
     def _get_ui_root(self):
         # Prefer explicitly passed root; fall back to tkinter's global default root if available.
         try:
@@ -377,6 +383,10 @@ class MatchingEngine:
     # =====================================================
     # SPLADE internals 
     # =====================================================
+
+    # TODO: oncern needed to addres for scability 
+    # There is a need to restrucutre and rename the nameing conventions of the matching engine to not be speicific towards the ai semantic embeddeding sparse and re rankers.
+    # This way swapping models would be more intuitive. scability will increase as well. 
 
     def _try_load_splade_doc_cache(self) -> bool:
         if not ENG_SPARSE_CACHE_ENABLE:
@@ -427,8 +437,7 @@ class MatchingEngine:
                 print(f"[SPLADE] failed to load doc cache: {e}")
             return False
 
-    
-    
+    # Splade cahching works, but an issue with it is that unlike the embeded, any change to the input BOM changes cuases a complete reworking of th esplade model, meaning we have to wait or all 5000+ splade thingies to do things
     def _save_splade_doc_cache(self) -> None:
         if not ENG_SPARSE_CACHE_ENABLE:
             return
@@ -709,6 +718,18 @@ class MatchingEngine:
     # =====================================================
     # PTYPE SIGNAL (engine-owned)
     # =====================================================
+
+    #TODO: concern needed to address for scalability
+    # fix ptype hard gating. a big issue is that way we match part types is a limitiing factor, as if th epart type is incorrect downstream issues will occure in the matching. 
+    # this needs ot be reworded and better logic reguarding searchign thogh the CNS needs to be resovled beofre hand before applying matching p types. 
+
+    # ptype matching may be hindering the process here. cardcodign any values like res cap ind or diode is the wrong implementation and all of this should be removed.
+    # Ptype matching will occur newly now based on number sources of the componnt nubering system
+
+    # there are truths and non truths in all of this:
+    # 1: The CNS provides to us a number catergoization of types 1-99. Each invnetory item will need to explicitly be matched with its ptype (easy to do, the company part number prefix TELLS us what part it belongs under)
+    # 2: in the matching logic, when given a part number from a BOM, we need to attach a ptype match to each part SOMEHOW. then when comparing against the inventory, we need to make sure that ptypes match (lowering the pool of data it needs to sluth through reducing error margins)
+
     def _ptype_signal(self, obj: Any) -> Dict[str, Any]:
         """
         Returns a dict:
@@ -770,6 +791,8 @@ class MatchingEngine:
 
         return {"ptype": ptype, "confidence": conf, "source": src}
     
+
+    
     def _ptype(self, parsed: Dict[str, Any]) -> str:
         # Backward-compatible wrapper: "ptype bucket only"
         t = (parsed.get("type") or parsed.get("component") or parsed.get("kind") or "").strip().upper()
@@ -783,6 +806,9 @@ class MatchingEngine:
             return "DIODE"
         return "OTHER"
 
+
+
+    # really need to offload all of this parsing to th eparsing engine itself. keep within the scope of the file.
     def _norm_pkg(self, x: str) -> str:
         s = (x or "").strip().upper()
         return s.replace(" ", "").replace("-", "").replace("_", "")
@@ -1103,8 +1129,9 @@ class MatchingEngine:
         }
     
     # =====================================================
-    # Match tiers
+    # Match tiers - litterally the heart of this all
     # =====================================================
+
     def match_single_part(self, npr: NPRPart) -> MatchResult:
         # Tier 1 — Exact MFG PN
         if npr.mfgpn:

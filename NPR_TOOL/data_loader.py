@@ -21,7 +21,6 @@ BODY_RE = re.compile(r"^\s*(\d{5})\s*$")
 # 1 = always read a copied file (cached first), 0 = try direct then fallback
 SAFE_SHARED_FILE_READS = 1
 
-
 # =====================================================
 # Small helpers
 # =====================================================
@@ -252,6 +251,10 @@ DEFAULT_ALT_ALIASES = HeaderAliases(
         "manufacturer_part_no": "mfgpn",
         "manufacturer_part_number": "mfgpn",
         "mpn": "mfgpn",
+        # Common master inventory exports use VendorItem / Vendor Item for manufacturer PN
+        "vendoritem": "mfgpn",
+        "vendor_item": "mfgpn",
+        "vendor_part_number": "mfgpn",
 
         "tariff_code": "tariff_code",
         "tariff_rate": "tariff_rate",
@@ -261,6 +264,9 @@ DEFAULT_ALT_ALIASES = HeaderAliases(
         "average_cost": "average_cost",
     }
 )
+
+
+
 
 # =====================================================
 # Inventory Aliases (NEW)
@@ -850,8 +856,209 @@ class DataLoader:
 
         return subs_by_base, mpn_to_base
 
+
     # =====================================================
-    # NPR / BOM SHEET (patched A/B/C)
+    # NEW (v2 schema): Inventory Company Snapshot Builders
+    # =====================================================
+    @staticmethod
+    def load_erp_stock_totals(path: str) -> Dict[str, int]:
+        """Load ERP inventory sheet and return {itemnum/cpn -> stock_total}.
+
+        This function is intentionally defensive: ERP extracts vary a lot.
+        We detect the header row by keywords and then look for a likely
+        stock/on-hand column.
+        """
+        raw = read_excel_with_temp_copy(path, header=None, dtype=str)
+
+        header_row = DataLoader._find_header_row_by_keywords(
+            raw,
+            required_keywords=["item"],
+            scan_rows=50,
+        )
+
+        df = read_excel_with_temp_copy(path, header=header_row, dtype=str).fillna("")
+        df.columns = [norm_header_snake(c) for c in df.columns]
+        df = DataLoader._make_unique_columns(df)
+
+        # Identify the CPN/itemnum column
+        item_col = None
+        for c in df.columns:
+            if c in ("itemnum","ItemNumber", "item_number", "itemnumber"):
+                item_col = c
+                break
+        if item_col is None:
+            # fallback: first column containing 'item'
+            for c in df.columns:
+                if "item" in str(c):
+                    item_col = c
+                    break
+        if item_col is None:
+            raise ValueError(f"ERP inventory: could not identify item number column. Columns={list(df.columns)}")
+
+        # Identify a stock/on-hand column
+        stock_col = None
+        candidates = [
+            "TotalQty", "qty", "Total_Qty"
+        ]
+        for c in candidates:
+            if c in df.columns:
+                stock_col = c
+                break
+        if stock_col is None:
+            # fuzzy: any column containing both qty/quantity and hand/avail/stock
+            for c in df.columns:
+                lc = str(c).lower()
+                if ("qty" in lc or "quantity" in lc):
+                    stock_col = c
+                    break
+        if stock_col is None:
+            raise ValueError(f"ERP inventory: could not identify stock/on-hand column. Columns={list(df.columns)}")
+
+        out: Dict[str, int] = {}
+        for _, row in df.iterrows():
+            itemnum = safe_str(row.get(item_col, "")).strip()
+            if not itemnum:
+                continue
+            raw_qty = safe_str(row.get(stock_col, ""))
+            try:
+                qty = int(float(raw_qty)) if raw_qty else 0
+            except Exception:
+                qty = 0
+            out[itemnum] = out.get(itemnum, 0) + qty
+        return out
+
+    @staticmethod
+    def build_inventory_company_parts(
+        master_inventory_path: str,
+        *,
+        erp_inventory_path: Optional[str] = None,
+        alt_aliases: HeaderAliases = DEFAULT_ALT_ALIASES,
+    ) -> tuple[List[dict], List[InventoryPart]]:
+        """Build inventory_company rows for DB persistence + a flat InventoryPart list for matching.
+
+        Returns:
+          company_parts_rows: list[dict] matching InventoryCompanyRepo.upsert_company_parts() contract
+          flat_inventory:     list[InventoryPart] (one per alternate) for MatchingEngine compatibility
+        """
+        raw = read_excel_with_temp_copy(master_inventory_path, header=None, dtype=str)
+
+        header_row = DataLoader._find_header_row_by_keywords(
+            raw,
+            # include vendor/item wording because many master exports use VendorItem instead of Manufacturer PN
+            required_keywords=["item", "description", "manufacturer", "pn", "vendor"],
+            scan_rows=50,
+        )
+
+        df = read_excel_with_temp_copy(master_inventory_path, header=header_row, dtype=str).fillna("")
+        df = DataLoader._normalize_and_alias_columns(df, alt_aliases)
+
+        # Fallback normalization: some master inventory extracts label the MPN column as VendorItem.
+        # If aliasing did not create mfgpn, map vendoritem/vendor_item style columns into mfgpn.
+        if "mfgpn" not in df.columns:
+            for c in list(df.columns):
+                lc = str(c).strip().lower()
+                if lc in ("vendoritem", "vendor_item", "vendor_part_number"):
+                    df = df.copy()
+                    df["mfgpn"] = df[c]
+                    break
+
+        if "itemnum" not in df.columns:
+            raise ValueError(f"Master inventory missing itemnum column. Detected: {list(df.columns)}")
+
+        # Optional ERP stock totals
+        stock_totals: Dict[str, int] = {}
+        if erp_inventory_path:
+            try:
+                stock_totals = DataLoader.load_erp_stock_totals(erp_inventory_path)
+            except Exception as e:
+                print(f"[WARN] ERP stock load failed ({erp_inventory_path}): {e}")
+
+        grouped: Dict[str, dict] = {}
+        flat: List[InventoryPart] = []
+
+        def _as_float(x: str) -> Optional[float]:
+            x = (x or "").strip()
+            if not x:
+                return None
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        for _, row in df.iterrows():
+            cpn = safe_str(row.get("itemnum", "")).strip()
+            if not cpn:
+                continue
+
+            desc = safe_str(row.get("desc", "")).strip()
+            mfgname = safe_str(row.get("mfgname", "")).strip()
+            mfgid = safe_str(row.get("mfgid", "")).strip()
+            mpn = DataLoader.clean_mpn(safe_str(row.get("mfgpn", "") or row.get("vendoritem", "")))
+
+            tariff_code = safe_str(row.get("tariff_code", "")).strip()
+            tariff_rate = _as_float(safe_str(row.get("tariff_rate", "")))
+            last_cost = _as_float(safe_str(row.get("last_cost", "")))
+            standard_cost = _as_float(safe_str(row.get("standard_cost", "")))
+            average_cost = _as_float(safe_str(row.get("average_cost", "")))
+
+            if cpn not in grouped:
+                grouped[cpn] = {
+                    "cpn": cpn,
+                    "canonical_desc": desc,
+                    "stock_total": int(stock_totals.get(cpn, 0) or 0),
+                    "alternates": [],
+                }
+            else:
+                if desc and not grouped[cpn].get("canonical_desc"):
+                    grouped[cpn]["canonical_desc"] = desc
+
+            if mpn or mfgname or mfgid:
+                grouped[cpn]["alternates"].append(
+                    {
+                        "mfgname": mfgname,
+                        "mfgid": mfgid,
+                        "mpn": mpn,
+                        # keep both “current” and “last” price fields if available
+                        "unit_price": average_cost if average_cost is not None else last_cost,
+                        "last_unit_price": last_cost,
+                        "standard_cost": standard_cost,
+                        "average_cost": average_cost,
+                        "tariff_code": tariff_code,
+                        "tariff_rate": tariff_rate,
+                        "meta": {k: safe_str(row.get(k, "")) for k in df.columns},
+                    }
+                )
+
+                # Flat inventory record for matching (legacy-compatible)
+                flat.append(
+                    InventoryPart(
+                        itemnum=cpn,
+                        desc=desc,
+                        mfgid=mfgid,
+                        mfgname=mfgname,
+                        vendoritem=mpn,
+                        raw_fields={k: safe_str(row.get(k, "")) for k in df.columns},
+                        parsed={},
+                    )
+                )
+
+        # If ERP stock was provided, ensure all known stock-only parts exist too
+        for cpn, qty in (stock_totals or {}).items():
+            if cpn not in grouped:
+                grouped[cpn] = {
+                    "cpn": cpn,
+                    "canonical_desc": "",
+                    "stock_total": int(qty or 0),
+                    "alternates": [],
+                }
+            else:
+                grouped[cpn]["stock_total"] = int(qty or 0)
+
+        return list(grouped.values()), flat
+
+
+    # =====================================================
+    # NPR / BOM SHEET
     # =====================================================
     @staticmethod
     def load_npr(path: str, aliases: HeaderAliases = DEFAULT_NPR_ALIASES) -> List[NPRPart]:
@@ -925,10 +1132,10 @@ class DataLoader:
             alt_mpns = [DataLoader.clean_mpn(get(c)) for c in alt_cols]
             alt_mpns = [m for m in alt_mpns if m]
 
-            # Patch C: guarantee a unique identifier for node creation downstream
+            # guarantee a unique identifier for node creation downstream
             partnum = get("part_number") or f"ROW-{i}"
 
-            # Patch A: drop blank-enough BOM rows
+            # drop blank-enough BOM rows
             if not desc and not primary_mpn and not alt_mpns:
                 continue
 
@@ -962,11 +1169,11 @@ class DataLoader:
         try:
             return DataLoader.load_npr(path, aliases=aliases)
         except Exception as e:
-            print(f"⚠️ load_npr failed ({e}). Falling back to load_simple_parts_list...")
+            print(f"load_npr failed ({e}). Falling back to load_simple_parts_list...")
             return DataLoader.load_simple_parts_list(path)
 
     # =====================================================
-    # SIMPLE 2-COLUMN PARTS LIST (patched C)
+    # SIMPLE 2-COLUMN PARTS LIST 
     # =====================================================
     @staticmethod
     def load_simple_parts_list(path: str) -> List[NPRPart]:
@@ -993,13 +1200,13 @@ class DataLoader:
             mpn_raw = safe_str(row.get(mpn_col or "", ""))
             mpn_val = DataLoader.clean_mpn(mpn_raw)
 
-            # Patch A: drop blank-enough rows
+            # drop blank-enough rows
             if not desc_val and not mpn_val:
                 continue
 
             parts.append(
                 NPRPart(
-                    partnum=f"ROW-{i}",  # Patch C: unique id
+                    partnum=f"ROW-{i}",  #  unique id
                     desc=desc_val,
                     mfgname="",
                     mfgpn=mpn_val,

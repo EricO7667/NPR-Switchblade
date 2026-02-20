@@ -8,8 +8,6 @@ from pathlib import Path
 from typing import Optional
 
 
-SCHEMA_VERSION = 1
-
 
 def default_db_path() -> str:
     base_dir = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -27,9 +25,8 @@ class DBConfig:
 def connect_db(cfg: Optional[DBConfig] = None) -> sqlite3.Connection:
     cfg = cfg or DBConfig()
 
-    # IMPORTANT:
-    # - check_same_thread=False lets us use the same connection across worker threads
-    # - we will still SERIALIZE access with a lock in repositories.py
+    # check_same_thread=False lets us use the same connection across worker threads.
+    # serialize DB access at a higher layer (Store/Repo lock).
     conn = sqlite3.connect(
         cfg.path,
         timeout=cfg.timeout_s,
@@ -47,157 +44,183 @@ def connect_db(cfg: Optional[DBConfig] = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """
-    Creates meta tables and migrates schema to SCHEMA_VERSION.
+    """Initialize the database schema (single-pass, no versioning).
+
+    This project is currently in active testing. We intentionally avoid schema
+    version tracking/migrations and simply ensure the full schema exists on startup.
     Safe to call on every startup.
     """
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS schema_meta (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            schema_version INTEGER NOT NULL
-        );
-        """
-    )
 
-    row = conn.execute("SELECT schema_version FROM schema_meta WHERE id = 1;").fetchone()
-    if row is None:
-        conn.execute("INSERT INTO schema_meta (id, schema_version) VALUES (1, 0);")
-        current = 0
-    else:
-        current = int(row["schema_version"])
-
-    if current > SCHEMA_VERSION:
-        raise RuntimeError(
-            f"DB schema_version={current} is newer than app supports ({SCHEMA_VERSION})."
-        )
-
-    # Apply migrations in order
-    with conn:
-        while current < SCHEMA_VERSION:
-            next_v = current + 1
-            _apply_migration(conn, next_v)
-            conn.execute("UPDATE schema_meta SET schema_version = ? WHERE id = 1;", (next_v,))
-            current = next_v
-
-
-def _apply_migration(conn: sqlite3.Connection, version: int) -> None:
-    if version == 1:
-        _migration_v1(conn)
-        return
-    raise RuntimeError(f"Unknown migration version: {version}")
-
-
-def _migration_v1(conn: sqlite3.Connection) -> None:
-    # Workspace table: one “job” that can be reopened
+    # Core tables
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS workspace (
             workspace_id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'ACTIVE', -- ACTIVE | ARCHIVED | EXPORTED
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
 
-            bom_id TEXT,
-            inventory_snapshot_id TEXT,
-
-            -- config hashes/versions to support reproducibility later
-            parse_config_hash TEXT DEFAULT '',
-            match_config_hash TEXT DEFAULT '',
-
-            FOREIGN KEY (bom_id) REFERENCES bom(bom_id) ON DELETE SET NULL,
-            FOREIGN KEY (inventory_snapshot_id) REFERENCES inventory_snapshot(inventory_snapshot_id) ON DELETE SET NULL
-        );
-        """
-    )
-
-    # BOM import artifact
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bom (
-            bom_id TEXT PRIMARY KEY,
-            source_path TEXT,
-            source_hash TEXT NOT NULL,
-            imported_at TEXT NOT NULL,
-            row_count INTEGER NOT NULL DEFAULT 0
-        );
-        """
-    )
-
-    # BOM rows (persist your NPRPart-ish row data)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bom_row (
-            bom_row_id TEXT PRIMARY KEY,
-            bom_id TEXT NOT NULL,
-            row_index INTEGER NOT NULL,
-
-            -- canonical fields used commonly
-            partnum TEXT DEFAULT '',
-            mfgpn TEXT DEFAULT '',
-            mfgname TEXT DEFAULT '',
-            supplier TEXT DEFAULT '',
-            description TEXT DEFAULT '',
-
-            raw_fields_json TEXT NOT NULL DEFAULT '{}',
-            parsed_json TEXT NOT NULL DEFAULT '{}',
-
-            UNIQUE(bom_id, row_index),
-            FOREIGN KEY (bom_id) REFERENCES bom(bom_id) ON DELETE CASCADE
-        );
-        """
-    )
-
-    # Inventory snapshot metadata
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS inventory_snapshot (
-            inventory_snapshot_id TEXT PRIMARY KEY,
-            source_path TEXT,
-            source_hash TEXT NOT NULL,
-            loaded_at TEXT NOT NULL,
-            row_count INTEGER NOT NULL DEFAULT 0,
+            label TEXT DEFAULT '',
+            bom_source_path TEXT DEFAULT '',
+            inventory_master_path TEXT DEFAULT '',
+            inventory_erp_path TEXT DEFAULT '',
+            cns_path TEXT DEFAULT '',
             notes TEXT DEFAULT ''
         );
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_workspace_status ON workspace(status);")
 
-    # Only persist “touched” inventory records that decisions reference
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS inventory_resolved (
-            inventory_resolved_id TEXT PRIMARY KEY,
-            inventory_snapshot_id TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS bom_line_input (
+            workspace_id TEXT NOT NULL,
+            input_line_id INTEGER NOT NULL,
+            imported_at TEXT NOT NULL,
+            raw_json TEXT NOT NULL DEFAULT '{}',
 
-            -- canonical lookup keys
-            itemnum TEXT NOT NULL,
-            vendoritem TEXT DEFAULT '',
-            mfgpn TEXT DEFAULT '',
-            mfgname TEXT DEFAULT '',
+            partnum TEXT DEFAULT '',
             description TEXT DEFAULT '',
+            qty REAL NOT NULL DEFAULT 0,
+            refdes TEXT DEFAULT '',
+            item_type TEXT DEFAULT '',
+            mfgname TEXT DEFAULT '',
+            mfgpn TEXT DEFAULT '',
+            supplier TEXT DEFAULT '',
 
-            raw_fields_json TEXT NOT NULL DEFAULT '{}',
-            parsed_json TEXT NOT NULL DEFAULT '{}',
-
-            UNIQUE(inventory_snapshot_id, itemnum),
-            FOREIGN KEY (inventory_snapshot_id) REFERENCES inventory_snapshot(inventory_snapshot_id) ON DELETE CASCADE
+            PRIMARY KEY (workspace_id, input_line_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspace(workspace_id) ON DELETE CASCADE
         );
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_bom_input_ws ON bom_line_input(workspace_id);")
 
-    # Decision nodes: your UI unit (DecisionNode)
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS decision_node (
-            node_id TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS bom_line_state (
             workspace_id TEXT NOT NULL,
+            line_id INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
 
-            -- Link back to exact BOM row (hard connection BOM ↔ NPR decisions)
-            bom_row_id TEXT,
+            cpn TEXT DEFAULT '',
+            selected_mpn TEXT DEFAULT '',
+            selected_mfg TEXT DEFAULT '',
 
-            base_type TEXT NOT NULL, -- NEW | EXISTS
+            confidence REAL NOT NULL DEFAULT 0.0,
+            match_type TEXT DEFAULT '',
 
+            needs_new_cpn INTEGER NOT NULL DEFAULT 0,
+            locked INTEGER NOT NULL DEFAULT 0,
+            needs_approval INTEGER NOT NULL DEFAULT 0,
+
+            notes TEXT DEFAULT '',
+            explain_json TEXT NOT NULL DEFAULT '{}',
+
+            PRIMARY KEY (workspace_id, line_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspace(workspace_id) ON DELETE CASCADE
+        );
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_bom_state_ws ON bom_line_state(workspace_id);")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inventory_company (
+            workspace_id TEXT NOT NULL,
+            cpn TEXT NOT NULL,
+
+            canonical_desc TEXT DEFAULT '',
+            stock_total INTEGER NOT NULL DEFAULT 0,
+            alternates_json TEXT NOT NULL DEFAULT '[]',
+            imported_at TEXT NOT NULL,
+
+            PRIMARY KEY (workspace_id, cpn),
+            FOREIGN KEY (workspace_id) REFERENCES workspace(workspace_id) ON DELETE CASCADE
+        );
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_inventory_company_ws ON inventory_company(workspace_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_inventory_company_cpn ON inventory_company(workspace_id, cpn);")
+
+    # Normalized CPN->MPN view for easy UI/querying
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inventory_company_item (
+            workspace_id TEXT NOT NULL,
+            cpn TEXT NOT NULL,
+
+            mfgname TEXT DEFAULT '',
+            mfgid TEXT DEFAULT '',
+            mpn TEXT NOT NULL DEFAULT '',
+
+            unit_price REAL,
+            last_unit_price REAL,
+            standard_cost REAL,
+            average_cost REAL,
+
+            tariff_code TEXT DEFAULT '',
+            tariff_rate REAL,
+            supplier TEXT DEFAULT '',
+            lead_time_days INTEGER,
+
+            meta_json TEXT NOT NULL DEFAULT '{}',
+            imported_at TEXT NOT NULL,
+
+            PRIMARY KEY (workspace_id, cpn, mfgname, mpn),
+            FOREIGN KEY (workspace_id, cpn) REFERENCES inventory_company(workspace_id, cpn) ON DELETE CASCADE
+        );
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_inv_item_cpn ON inventory_company_item(workspace_id, cpn);")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_inv_item_mpn ON inventory_company_item(workspace_id, mpn);")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS export_log (
+            export_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+
+            export_type TEXT NOT NULL DEFAULT '',
+            path TEXT NOT NULL DEFAULT '',
+            meta_json TEXT NOT NULL DEFAULT '{}',
+
+            FOREIGN KEY (workspace_id) REFERENCES workspace(workspace_id) ON DELETE CASCADE
+        );
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_export_ws ON export_log(workspace_id, created_at DESC);")
+
+    # Match persistence (UI renders from this)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS match_run (
+            run_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+
+            engine_name TEXT NOT NULL DEFAULT 'MatchingEngine',
+            engine_version TEXT NOT NULL DEFAULT '',
+            config_json TEXT NOT NULL DEFAULT '{}',
+            summary_json TEXT NOT NULL DEFAULT '{}',
+
+            FOREIGN KEY (workspace_id) REFERENCES workspace(workspace_id) ON DELETE CASCADE
+        );
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_match_run_ws ON match_run(workspace_id, created_at DESC);")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS match_node (
+            workspace_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+
+            line_id INTEGER NOT NULL,
+
+            base_type TEXT NOT NULL DEFAULT '',
             bom_uid TEXT DEFAULT '',
             bom_mpn TEXT DEFAULT '',
             description TEXT DEFAULT '',
@@ -218,21 +241,24 @@ def _migration_v1(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
 
+            PRIMARY KEY (workspace_id, run_id, node_id),
             FOREIGN KEY (workspace_id) REFERENCES workspace(workspace_id) ON DELETE CASCADE,
-            FOREIGN KEY (bom_row_id) REFERENCES bom_row(bom_row_id) ON DELETE SET NULL
+            FOREIGN KEY (run_id) REFERENCES match_run(run_id) ON DELETE CASCADE
         );
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_match_node_ws_run ON match_node(workspace_id, run_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_match_node_line ON match_node(workspace_id, line_id);")
 
-    # Alternates (Alternate)
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS alternate (
-            alt_id TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS match_alt (
+            workspace_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
             node_id TEXT NOT NULL,
-            rank INTEGER NOT NULL DEFAULT 0,
+            alt_id TEXT NOT NULL,
 
-            source TEXT NOT NULL, -- inventory|digikey|manual|api
+            source TEXT NOT NULL DEFAULT 'inventory',
 
             manufacturer TEXT DEFAULT '',
             manufacturer_part_number TEXT DEFAULT '',
@@ -248,6 +274,7 @@ def _migration_v1(conn: sqlite3.Connection) -> None:
 
             stock INTEGER NOT NULL DEFAULT 0,
             unit_cost REAL,
+
             supplier TEXT DEFAULT '',
 
             confidence REAL NOT NULL DEFAULT 0.0,
@@ -257,17 +284,20 @@ def _migration_v1(conn: sqlite3.Connection) -> None:
             selected INTEGER NOT NULL DEFAULT 0,
             rejected INTEGER NOT NULL DEFAULT 0,
 
-            raw_ref_json TEXT NOT NULL DEFAULT '{}',
             meta_json TEXT NOT NULL DEFAULT '{}',
+            raw_json  TEXT NOT NULL DEFAULT '{}',
 
-            FOREIGN KEY (node_id) REFERENCES decision_node(node_id) ON DELETE CASCADE
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+
+            PRIMARY KEY (workspace_id, run_id, alt_id),
+            FOREIGN KEY (workspace_id, run_id, node_id) REFERENCES match_node(workspace_id, run_id, node_id) ON DELETE CASCADE,
+            FOREIGN KEY (run_id) REFERENCES match_run(run_id) ON DELETE CASCADE
         );
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_match_alt_node ON match_alt(workspace_id, run_id, node_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_match_alt_selected ON match_alt(workspace_id, run_id, node_id, selected, rejected);")
 
-    # Indexes that matter immediately
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_workspace_status ON workspace(status);")
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_bom_row_bom ON bom_row(bom_id);")
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_node_workspace ON decision_node(workspace_id);")
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_alt_node ON alternate(node_id);")
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_inv_resolved_itemnum ON inventory_resolved(itemnum);")
+
+
