@@ -65,6 +65,9 @@ class DecisionWorkspaceCTK:
         self.current_node_id: Optional[str] = None
         self._pinned_alt_id: Optional[str] = None
         self._last_specs_key = None
+        self._suspend_node_select = False
+        self._pin_click_guard_alt = None
+        self._pin_click_guard_until = 0
 
         # ---- theme/colors (keep your palette; tweak later) ----
         self.COLORS = {
@@ -120,6 +123,17 @@ class DecisionWorkspaceCTK:
             "Treeview.Heading",
             background=[("active", self.COLORS["primary"])],
         )
+
+        # row color tags for node state cues
+        try:
+            self.node_row_colors = {
+                "ready": "#123A24",
+                "selected": "#0F2E4A",
+                "attention": "#3A1D1D",
+                "default": "#0B1220",
+            }
+        except Exception:
+            self.node_row_colors = {}
 
     # ---------------------------------------------------------------------
     # Toolbar
@@ -206,6 +220,12 @@ class DecisionWorkspaceCTK:
         vs.pack(side="right", fill="y")
 
         self.node_tree.bind("<<TreeviewSelect>>", self._on_node_select)
+        try:
+            self.node_tree.tag_configure("row_ready", background="#123A24", foreground="#E5E7EB")
+            self.node_tree.tag_configure("row_selected", background="#0F2E4A", foreground="#E5E7EB")
+            self.node_tree.tag_configure("row_attention", background="#3A1D1D", foreground="#FDECEC")
+        except Exception:
+            pass
 
     def _build_header(self, parent: ctk.CTkFrame):
         parent.grid_columnconfigure(0, weight=1)
@@ -238,8 +258,14 @@ class DecisionWorkspaceCTK:
         self.apply_pn_btn = ctk.CTkButton(pn_row, text="Apply", command=self._apply_company_pn, width=80)
         self.apply_pn_btn.pack(side="left", padx=(0, 10))
 
-        self.mark_ready_btn = ctk.CTkButton(parent, text="Mark Ready", command=self._on_mark_ready, width=140)
-        self.mark_ready_btn.pack(pady=(0, 14))
+        btn_row = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_row.pack(pady=(0, 14))
+
+        self.mark_ready_btn = ctk.CTkButton(btn_row, text="Mark Ready", command=self._on_mark_ready, width=140)
+        self.mark_ready_btn.pack(side="left", padx=(0, 8))
+
+        self.unmark_ready_btn = ctk.CTkButton(btn_row, text="Unmark Ready", command=self._on_unmark_ready, width=140, fg_color="#374151", hover_color="#4B5563")
+        self.unmark_ready_btn.pack(side="left")
 
     def _build_bottom_panes(self, parent: ctk.CTkFrame):
         parent.grid_rowconfigure(0, weight=1)
@@ -265,9 +291,39 @@ class DecisionWorkspaceCTK:
         self.specs_title = ctk.CTkLabel(self.specs_scroll, text="Information", font=ctk.CTkFont(size=14, weight="bold"))
         self.specs_title.pack(anchor="w", pady=(0, 8))
 
+        # smoother wheel routing: scroll only the cards panel when cursor is over it
+        try:
+            self.cards_scroll.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
+        except Exception:
+            pass
+
     # ---------------------------------------------------------------------
     # Rendering
     # ---------------------------------------------------------------------
+    def _on_global_mousewheel(self, event):
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+            if not w:
+                return
+            # Only intercept when pointer is inside the cards panel; otherwise let defaults handle it.
+            p = w
+            inside_cards = False
+            while p is not None:
+                if p == self.cards_scroll:
+                    inside_cards = True
+                    break
+                p = getattr(p, 'master', None)
+            if not inside_cards:
+                return
+            delta = 0
+            if getattr(event, 'delta', 0):
+                delta = -1 if event.delta > 0 else 1
+            if delta:
+                self.cards_scroll._parent_canvas.yview_scroll(delta, 'units')
+                return "break"
+        except Exception:
+            return
+
     def _render_empty_state(self):
         self.h_title.configure(text="No Selection")
         self.h_desc.configure(text="")
@@ -298,16 +354,33 @@ class DecisionWorkspaceCTK:
                 or getattr(node, "bom_mpn", "")
             )
             conf_display = f"{(getattr(node, 'confidence', 0.0) or 0.0) * 100:.1f}%"
+            # color cue for upper panel rows
+            tags = []
+            try:
+                alts = list(getattr(node, "alternates", []) or [])
+                selected_count = sum(1 for a in alts if getattr(a, "selected", False))
+                active_count = sum(1 for a in alts if not getattr(a, "rejected", False))
+                if bool(getattr(node, "locked", False)):
+                    tags = ["row_ready"]
+                elif selected_count > 0:
+                    tags = ["row_selected"]
+                elif alts and active_count == 0:
+                    tags = ["row_attention"]
+            except Exception:
+                tags = []
             self.node_tree.insert(
                 "", "end",
                 iid=node.id,
                 values=(node.id, node.base_type, display_mpn, getattr(node.status, "value", str(node.status)), conf_display),
+                tags=tuple(tags),
             )
 
     # ---------------------------------------------------------------------
     # Event handlers (wire to your existing controller methods)
     # ---------------------------------------------------------------------
     def _on_node_select(self, _e=None):
+        if getattr(self, "_suspend_node_select", False):
+            return
         sel = self.node_tree.selection()
         if not sel:
             return
@@ -320,25 +393,42 @@ class DecisionWorkspaceCTK:
             return
 
         self.current_node_id = node_id
+        try:
+            alts = list(getattr(node, "alternates", []) or [])
+            picked = next((a for a in alts if getattr(a, "selected", False) and not getattr(a, "rejected", False)), None)
+            self._pinned_alt_id = getattr(picked, "id", None) if picked else None
+        except Exception:
+            self._pinned_alt_id = None
         self._render_header_state(node)
         self._render_cards(node)
         self._render_specs_for_node(node)
 
     def _render_header_state(self, node: DecisionNode):
-        # Port your exact legacy header logic here next
-        self.h_title.configure(text=f"Company PN: {getattr(node, 'internal_part_number', '') or '—'}")
+        self.h_title.configure(text=f"Company PN: {getattr(node, 'internal_part_number', '') or getattr(node, 'assigned_part_number', '') or '—'}")
         self.h_desc.configure(text=f"BOM MPN: {getattr(node, 'bom_mpn', '') or '—'}")
         self.h_meta.configure(text=str(getattr(node.status, "value", node.status)))
 
         self.suggested_var.set((getattr(node, "suggested_pb", "") or "").strip())
         self.company_pn_var.set((getattr(node, "assigned_part_number", "") or getattr(node, "internal_part_number", "") or "").strip())
 
+        locked = bool(getattr(node, 'locked', False))
+        try:
+            self.mark_ready_btn.configure(state=("disabled" if locked else "normal"))
+            self.unmark_ready_btn.configure(state=("normal" if locked else "disabled"))
+            self.apply_pn_btn.configure(state=("disabled" if locked else "normal"))
+            self.company_pn_entry.configure(state=("disabled" if locked else "normal"))
+        except Exception:
+            pass
+
     def _render_cards(self, node: DecisionNode):
         for w in self.cards_scroll.winfo_children():
             w.destroy()
 
-        self._pinned_alt_id = None
+        prev_pinned = self._pinned_alt_id
         alts = list(getattr(node, "alternates", []) or [])
+        valid_ids = {getattr(a, 'id', None) for a in alts}
+        self._pinned_alt_id = prev_pinned if prev_pinned in valid_ids else None
+
         internal_active = [a for a in alts if (not getattr(a, "rejected", False)) and getattr(a, "source", "") == "inventory"]
         external_active = [a for a in alts if (not getattr(a, "rejected", False)) and getattr(a, "source", "") != "inventory"]
         rejected_all = [a for a in alts if getattr(a, "rejected", False)]
@@ -350,7 +440,7 @@ class DecisionWorkspaceCTK:
         self._build_card_section(self.cards_scroll, f"Internal Matches ({len(internal_active)})", internal_active, node)
         self._build_card_section(self.cards_scroll, f"External Alternates ({len(external_active)})", external_active, node)
         if rejected_all:
-            self._build_card_section(self.cards_scroll, f"Rejected ({len(rejected_all)})", rejected_all, node)
+            self._build_card_section(self.cards_scroll, f"REJECTED ({len(rejected_all)})", rejected_all, node)
 
     def _render_specs_for_node(self, node: DecisionNode):
         alts = list(getattr(node, "alternates", []) or [])
@@ -423,14 +513,22 @@ class DecisionWorkspaceCTK:
         mfg_pn = (getattr(alt, "manufacturer_part_number", "") or "").strip()
         mfg_name = (getattr(alt, "manufacturer", "") or "").strip()
 
+        rep_vendoritem = str(((getattr(alt, 'meta', {}) or {}).get('company_pn_rep_vendoritem', '') or '')).strip()
+        matched_ui = (getattr(alt, '_matched_mpn_ui', '') or '').strip()
         title = company_pn if is_inventory else (mfg_pn or company_pn or "(no part number)")
-        subtitle = mfg_pn if is_inventory else mfg_name
+        subtitle = (matched_ui or rep_vendoritem or mfg_pn) if is_inventory else mfg_name
 
         left = ctk.CTkFrame(head, fg_color="transparent")
         left.pack(side="left", fill="x", expand=True)
         ctk.CTkLabel(left, text=title or "—", anchor="w", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w")
         if subtitle:
             ctk.CTkLabel(left, text=subtitle, anchor="w", text_color=self.COLORS["text_dim"]).pack(anchor="w")
+        try:
+            alt_count = int(((getattr(alt, 'meta', {}) or {}).get('company_pn_mfgpn_count', 0) or 0))
+        except Exception:
+            alt_count = 0
+        if is_inventory and alt_count >= 1:
+            ctk.CTkLabel(left, text=f"MFGPNs: {alt_count}", text_color=self.COLORS['text_dim']).pack(anchor='w')
 
         conf = float(getattr(alt, "confidence", 0.0) or 0.0)
         if (getattr(alt, "source", "") != "inventory") and conf == 0.0 and not is_rejected:
@@ -444,52 +542,73 @@ class DecisionWorkspaceCTK:
 
         stock = self._display_stock_for_alt(alt)
         ctk.CTkLabel(inner, text=f"Source: {getattr(alt, 'source', '') or '-'}    Stock: {stock}",
-                     text_color=self.COLORS["text_dim"]).pack(anchor="w", padx=10, pady=(0, 6))
+                     text_color=self.COLORS["text_dim"]).pack(anchor="w", padx=10, pady=(0, 2))
+
+        badge_row = ctk.CTkFrame(inner, fg_color="transparent")
+        badge_row.pack(fill="x", padx=10, pady=(0, 4))
+        if is_selected:
+            ctk.CTkLabel(badge_row, text="LOCKED IN", fg_color="#14532D", corner_radius=6, padx=8, text_color="white").pack(side="left")
+        elif is_rejected:
+            ctk.CTkLabel(badge_row, text="REJECTED", fg_color="#7F1D1D", corner_radius=6, padx=8, text_color="white").pack(side="left")
+        elif is_pinned:
+            ctk.CTkLabel(badge_row, text="VIEWING", fg_color="#1E3A8A", corner_radius=6, padx=8, text_color="white").pack(side="left")
 
         row = ctk.CTkFrame(inner, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=(0, 10))
 
-        ctk.CTkButton(row, text=("Unpin" if is_pinned else "Pin"), width=70, height=28,
-                      fg_color="#1F2937", hover_color="#374151",
-                      command=lambda a=alt: self._pin_card(node, a)).pack(side="left", padx=(0, 6))
         ctk.CTkButton(row, text="Copy", width=70, height=28,
                       fg_color="#1F2937", hover_color="#374151",
                       command=lambda a=alt: self._copy_to_clipboard(self._card_copy_text(a), toast="Copied card details")).pack(side="left")
 
         if not getattr(node, "locked", False):
-            if not is_selected and not is_rejected:
+            if is_rejected:
+                ctk.CTkButton(row, text="Unreject", width=88, height=28,
+                              fg_color="#374151", hover_color="#4B5563",
+                              command=lambda a=alt: self._unreject_alt(node, a)).pack(side="right")
+            elif is_selected:
+                ctk.CTkButton(row, text="Unlock", width=78, height=28,
+                              fg_color="#14532D", hover_color="#166534",
+                              command=lambda a=alt: self._add_alt(node, a)).pack(side="right")
+                ctk.CTkButton(row, text="Reject", width=78, height=28,
+                              fg_color="#374151", hover_color="#4B5563",
+                              command=lambda a=alt: self._reject_alt(node, a)).pack(side="right", padx=(0,6))
+            else:
                 ctk.CTkButton(row, text="Reject", width=78, height=28,
                               fg_color="#374151", hover_color="#4B5563",
                               command=lambda a=alt: self._reject_alt(node, a)).pack(side="right", padx=(6, 0))
                 ctk.CTkButton(row, text="Add", width=70, height=28,
                               fg_color=self.COLORS["success"], hover_color="#16A34A",
                               command=lambda a=alt: self._add_alt(node, a)).pack(side="right")
-            elif is_rejected:
-                ctk.CTkButton(row, text="Unreject", width=88, height=28,
-                              fg_color="#374151", hover_color="#4B5563",
-                              command=lambda a=alt: self._unreject_alt(node, a)).pack(side="right")
-            elif is_selected:
-                ctk.CTkLabel(row, text="SELECTED", text_color=self.COLORS["success"],
-                             font=ctk.CTkFont(weight="bold")).pack(side="right")
 
         def _bind_recursive(widget):
             try:
-                widget.bind("<Button-1>", lambda _e, a=alt: self._pin_card(node, a))
+                # Do NOT bind focus-click onto the action row (buttons) or buttons themselves.
+                if (widget is not row) and (not isinstance(widget, ctk.CTkButton)):
+                    widget.bind("<Button-1>", lambda _e, a=alt: self._pin_card(node, a))
             except Exception:
                 pass
+            # Skip the action-row subtree entirely so button clicks never pin/focus the card.
+            if widget is row:
+                return
             for ch in getattr(widget, "winfo_children", lambda: [])():
                 _bind_recursive(ch)
         _bind_recursive(inner)
         return outer
 
     def _pin_card(self, node: DecisionNode, alt: Alternate):
+        # card click = focus/view this card (persistent highlight until another card is clicked)
+        import time
         aid = getattr(alt, "id", None)
-        self._pinned_alt_id = None if self._pinned_alt_id == aid else aid
-        self._render_cards(node)
-        if self._pinned_alt_id:
-            self._render_specs_for_alt(node, alt)
-        else:
-            self._render_specs_for_node(node)
+        now = time.monotonic()
+        if self._pin_click_guard_alt == aid and now < getattr(self, '_pin_click_guard_until', 0):
+            return "break"
+        self._pin_click_guard_alt = aid
+        self._pin_click_guard_until = now + 0.08
+        if self._pinned_alt_id != aid:
+            self._pinned_alt_id = aid
+            self._render_cards(node)
+        self._render_specs_for_alt(node, alt)
+        return "break"
 
     def _render_specs_for_alt(self, node: DecisionNode, alt: Optional[Alternate]):
         for w in self.specs_scroll.winfo_children():
@@ -506,27 +625,40 @@ class DecisionWorkspaceCTK:
             ctk.CTkLabel(self.specs_scroll, text="No details available.", text_color=self.COLORS["text_dim"]).pack(anchor="w")
             return
 
-        specs = self._specs_from_inventory(alt.raw) if getattr(alt, "raw", None) is not None else self._specs_from_alternate(alt)
-
-        if getattr(alt, "source", "") == "inventory" and getattr(alt, "internal_part_number", ""):
-            cpn = (getattr(alt, "internal_part_number", "") or "").strip().lower()
-            lines, seen = [], set()
-            for a in (getattr(node, "alternates", []) or []):
-                if getattr(a, "source", "") != "inventory":
-                    continue
-                if (getattr(a, "internal_part_number", "") or "").strip().lower() != cpn:
-                    continue
-                mpn = (getattr(a, "manufacturer_part_number", "") or "").strip()
-                if not mpn or mpn.lower() in seen:
-                    continue
-                seen.add(mpn.lower())
-                desc = (getattr(a, "description", "") or "").strip()
-                lines.append(f"{mpn} — {desc}" if desc else mpn)
-            if lines:
-                specs["AlternatesCount"] = str(len(lines))
-                specs["AlternatesList"] = "\n".join(lines)
+        export_mfgpn_options = []
+        try:
+            payload = self.controller.get_alt_detail_payload(node.id, alt.id)
+            if isinstance(payload, dict):
+                specs = dict(payload.get('specs') or {})
+                export_mfgpn_options = list(payload.get('export_mfgpn_options') or [])
+            else:
+                specs = self._specs_from_inventory(alt.raw) if getattr(alt, 'raw', None) is not None else self._specs_from_alternate(alt)
+        except Exception:
+            specs = self._specs_from_inventory(alt.raw) if getattr(alt, 'raw', None) is not None else self._specs_from_alternate(alt)
 
         self._render_specs(specs)
+
+        # Choose a specific MFG PN under the same company PN (controller-backed list)
+        try:
+            if getattr(alt, 'source', '') == 'inventory':
+                if not export_mfgpn_options:
+                    lines = [ln.strip() for ln in str(specs.get('AlternatesList', '') or '').splitlines() if ln.strip()]
+                    export_mfgpn_options = [ln.split('—',1)[0].strip() if '—' in ln else ln.strip() for ln in lines]
+                export_mfgpn_options = [m for m in export_mfgpn_options if str(m).strip()]
+                if export_mfgpn_options:
+                    ctk.CTkLabel(self.specs_scroll, text='Choose export MFG PN', text_color=self.COLORS['primary'],
+                                 font=ctk.CTkFont(size=11, weight='bold')).pack(anchor='w', pady=(10,4))
+                    seen = set()
+                    for mpn in export_mfgpn_options[:40]:
+                        mpn = str(mpn).strip()
+                        if not mpn or mpn.lower() in seen:
+                            continue
+                        seen.add(mpn.lower())
+                        b = ctk.CTkButton(self.specs_scroll, text=mpn, height=28, fg_color='#111827', hover_color='#1F2937',
+                                          command=lambda m=mpn, a=alt: self._set_group_mfgpn(node, a, m))
+                        b.pack(anchor='w', pady=2)
+        except Exception:
+            pass
 
     def _render_specs(self, specs: dict):
         def add_section(title: str):
@@ -638,6 +770,14 @@ class DecisionWorkspaceCTK:
             specs["PrimaryVendorNumber"] = alt.supplier
         return specs
 
+
+    def _set_group_mfgpn(self, node: DecisionNode, alt: Alternate, mfgpn: str):
+        try:
+            self.controller.set_preferred_inventory_mfgpn(node.id, alt.id, mfgpn)
+            self._refresh_after_alt_action(node.id, focus_alt_id=getattr(alt, 'id', None), refresh_table=True)
+        except Exception as e:
+            messagebox.showerror('Set MFG PN Failed', str(e))
+
     def _display_stock_for_alt(self, alt: Alternate):
         try:
             if getattr(alt, "raw", None) is not None:
@@ -661,37 +801,59 @@ class DecisionWorkspaceCTK:
             parts.append(f"Description: {alt.description}")
         return "\n".join(parts)
 
+    def _set_tree_selection_silent(self, node_id: str):
+        try:
+            cur = self.node_tree.selection()
+            if cur and cur[0] == node_id:
+                return
+            self._suspend_node_select = True
+            self.node_tree.selection_set(node_id)
+        finally:
+            try:
+                self.root.after(1, lambda: setattr(self, "_suspend_node_select", False))
+            except Exception:
+                self._suspend_node_select = False
+
+    def _refresh_after_alt_action(self, node_id: str, focus_alt_id: str | None = None, refresh_table: bool = True):
+        fresh = self.controller.get_node(node_id)
+        self._render_header_state(fresh)
+        self._render_cards(fresh)
+        picked = None
+        if focus_alt_id:
+            picked = next((a for a in (fresh.alternates or []) if a.id == focus_alt_id), None)
+        if picked is None:
+            self._render_specs_for_node(fresh)
+        else:
+            self._render_specs_for_alt(fresh, picked)
+        if refresh_table:
+            self.refresh_node_table()
+        self._set_tree_selection_silent(node_id)
+        return fresh
+
     def _add_alt(self, node: DecisionNode, alt: Alternate):
         try:
-            self.controller.select_alternate(node.id, alt.id)
-            fresh = self.controller.get_node(node.id)
-            self._render_header_state(fresh)
-            self._render_cards(fresh)
-            picked = next((a for a in (fresh.alternates or []) if a.id == alt.id), None)
-            self._render_specs_for_alt(fresh, picked)
-            self.refresh_node_table()
+            if getattr(alt, 'selected', False):
+                self.controller.unselect_alternate(node.id, alt.id)
+            else:
+                self.controller.select_alternate(node.id, alt.id)
+            self._pinned_alt_id = alt.id
+            self._refresh_after_alt_action(node.id, focus_alt_id=alt.id, refresh_table=True)
         except Exception as e:
             messagebox.showerror("Select Alternate Failed", str(e))
 
     def _reject_alt(self, node: DecisionNode, alt: Alternate):
         try:
             self.controller.reject_alternate(node.id, alt.id)
-            fresh = self.controller.get_node(node.id)
-            self._render_header_state(fresh)
-            self._render_cards(fresh)
-            self._render_specs_for_node(fresh)
-            self.refresh_node_table()
+            self._pinned_alt_id = alt.id
+            self._refresh_after_alt_action(node.id, focus_alt_id=alt.id, refresh_table=True)
         except Exception as e:
             messagebox.showerror("Reject Alternate Failed", str(e))
 
     def _unreject_alt(self, node: DecisionNode, alt: Alternate):
         try:
             self.controller.unreject_alternate(node.id, alt.id)
-            fresh = self.controller.get_node(node.id)
-            self._render_header_state(fresh)
-            self._render_cards(fresh)
-            self._render_specs_for_node(fresh)
-            self.refresh_node_table()
+            self._pinned_alt_id = alt.id
+            self._refresh_after_alt_action(node.id, focus_alt_id=alt.id, refresh_table=True)
         except Exception as e:
             messagebox.showerror("Unreject Alternate Failed", str(e))
     # ---------------------------------------------------------------------
@@ -753,8 +915,45 @@ class DecisionWorkspaceCTK:
         self.status_var.set(f"Matching complete. Built {n} decision nodes.")
 
     def _open_workspace(self):
-        # We’ll port your legacy modal into a CTkToplevel next
-        messagebox.showinfo("TODO", "Open Workspace modal will be ported next.")
+        try:
+            rows = self.controller.list_workspaces(status='ACTIVE') or []
+        except Exception as e:
+            messagebox.showerror('Open Workspace Failed', str(e))
+            return
+        if not rows:
+            messagebox.showinfo('Open Workspace', 'No active workspaces found.')
+            return
+
+        win = ctk.CTkToplevel(self.root)
+        win.title('Open Workspace')
+        win.geometry('720x420')
+        win.grab_set()
+
+        ctk.CTkLabel(win, text='Select Workspace', font=ctk.CTkFont(size=16, weight='bold')).pack(pady=(10,6))
+        lb = tk.Listbox(win, height=14, bg='#0F172A', fg='white', selectbackground='#2563EB')
+        lb.pack(fill='both', expand=True, padx=12, pady=8)
+        for r in rows:
+            wid = str(r.get('workspace_id',''))
+            name = str(r.get('name','') or '')
+            stamp = str(r.get('updated_at','') or r.get('created_at','') or '')
+            lb.insert('end', f"{wid}   |   {name}   |   {stamp}")
+
+        def do_open():
+            sel = lb.curselection()
+            if not sel:
+                return
+            wid = str(rows[sel[0]].get('workspace_id',''))
+            try:
+                n = self.controller.open_workspace(wid)
+                self.current_node_id = None
+                self.refresh_node_table()
+                self._render_empty_state()
+                self.status_var.set(f'Opened workspace {wid} ({n} nodes).')
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror('Open Workspace Failed', str(e))
+
+        ctk.CTkButton(win, text='Open', command=do_open).pack(pady=(0,10))
 
     def _save_workspace(self):
         try:
@@ -789,7 +988,7 @@ class DecisionWorkspaceCTK:
     def _apply_company_pn(self):
         if not self.current_node_id:
             return
-        pn = (self.company_pn_var.get() or "").strip()
+        pn = (self.company_pn_var.get() or self.suggested_var.get() or "").strip()
         if not pn:
             messagebox.showwarning("Missing PN", "Enter a Company Part Number first.")
             return
@@ -797,6 +996,8 @@ class DecisionWorkspaceCTK:
             self.controller.set_assigned_part_number(self.current_node_id, pn)
             node = self.controller.get_node(self.current_node_id)
             self._render_header_state(node)
+            self._render_cards(node)
+            self._render_specs_for_node(node)
             self.refresh_node_table()
         except Exception as e:
             messagebox.showerror("Apply PN Failed", str(e))
@@ -812,6 +1013,21 @@ class DecisionWorkspaceCTK:
             self.refresh_node_table()
         except Exception as e:
             messagebox.showerror("Mark Ready Failed", str(e))
+
+
+    def _on_unmark_ready(self):
+        if not self.current_node_id:
+            messagebox.showwarning("No Selection", "Select a node first.")
+            return
+        try:
+            self.controller.unmark_ready(self.current_node_id)
+            node = self.controller.get_node(self.current_node_id)
+            self._render_header_state(node)
+            self._render_cards(node)
+            self._render_specs_for_node(node)
+            self.refresh_node_table()
+        except Exception as e:
+            messagebox.showerror("Unmark Ready Failed", str(e))
 
     def _on_close(self):
         try:

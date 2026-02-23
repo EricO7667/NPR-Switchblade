@@ -1963,8 +1963,46 @@ class DecisionController:
                     confidence=confidence,
                     relationship="Base/Selected",
                 )
-                if winning_mpn_for_display:
-                    base_alt._matched_mpn_ui = winning_mpn_for_display
+
+                # Stamp grouped MFGPN metadata for the base card too (same as candidates),
+                # and ONLY show a matched MFGPN that actually belongs to this CPN group.
+                try:
+                    base_subs = getattr(inv, "substitutes", None) or []
+                    rep_vendoritem = (getattr(inv, "vendoritem", "") or "").strip()
+                    seen_grp = set()
+                    grp_mpns = []
+                    def _push_grp(m):
+                        m = (m or "").strip()
+                        if not m:
+                            return
+                        k = m.lower()
+                        if k in seen_grp:
+                            return
+                        seen_grp.add(k)
+                        grp_mpns.append(m)
+                    _push_grp(rep_vendoritem)
+                    for _s in base_subs:
+                        if isinstance(_s, str):
+                            _push_grp(_s)
+                        else:
+                            _push_grp(getattr(_s, "mfgpn", "") or getattr(_s, "manufacturer_part_number", "") or "")
+
+                    base_alt.meta = dict(getattr(base_alt, "meta", {}) or {})
+                    base_alt.meta["company_pn_mfgpn_count"] = len(grp_mpns)
+                    # keep aliases only (exclude rep vendoritem) for consistency with candidate stamping
+                    base_alt.meta["company_pn_mfgpns"] = grp_mpns[1:] if len(grp_mpns) > 1 else []
+                    base_alt.meta["company_pn_rep_vendoritem"] = rep_vendoritem
+
+                    win = (winning_mpn_for_display or "").strip()
+                    if win and win.lower() in {m.lower() for m in grp_mpns}:
+                        base_alt._matched_mpn_ui = win
+                    else:
+                        # BOM MPN may have won matching, but if it is not a true alternate under this CPN,
+                        # display the representative/real grouped MFGPN on the card.
+                        base_alt._matched_mpn_ui = rep_vendoritem or (grp_mpns[0] if grp_mpns else "")
+                except Exception:
+                    if winning_mpn_for_display:
+                        base_alt._matched_mpn_ui = winning_mpn_for_display
 
                 node.alternates.append(base_alt)
                 seen_itemnums.add(itemnum)
@@ -2448,6 +2486,141 @@ class DecisionController:
         self._recompute_node_flags(node)
         self._persist_node_and_alts(node)
 
+    def unmark_ready(self, node_id: str) -> None:
+        node = self.get_node(node_id)
+        node.locked = False
+        # move back to a workable status without trying to fully infer everything
+        if getattr(node, 'internal_part_number', '') or node.has_selection():
+            node.status = DecisionStatus.NEEDS_DECISION
+        else:
+            node.status = DecisionStatus.NEEDS_DECISION
+        self._recompute_node_flags(node)
+        self._persist_node_and_alts(node)
+
+    def set_preferred_inventory_mfgpn(self, node_id: str, alt_id: str, mfgpn: str) -> None:
+        node = self.get_node(node_id)
+        self._ensure_unlocked(node)
+        alt = self._find_alt(node, alt_id)
+        if (getattr(alt, 'source', '') or '').strip().lower() != 'inventory':
+            raise ValueError('Preferred MFG PN can only be set for inventory alternates.')
+        mfgpn = (mfgpn or '').strip()
+        if not mfgpn:
+            raise ValueError('MFG PN is blank.')
+        alt.manufacturer_part_number = mfgpn
+        alt.meta = dict(getattr(alt, 'meta', {}) or {})
+        alt.meta['company_pn_rep_vendoritem'] = mfgpn
+        node.explain = dict(getattr(node, 'explain', {}) or {})
+        node.explain['preferred_inventory_mfgpn'] = mfgpn
+        self._persist_node_and_alts(node)
+
+
+    def get_alt_detail_payload(self, node_id: str, alt_id: str) -> dict:
+        """
+        Controller-backed detail payload for the UI (DB/controller is the truth).
+        Returns:
+          { "specs": {...}, "export_mfgpn_options": [..] }
+        """
+        node = self.get_node(node_id)
+        alt = self._find_alt(node, alt_id)
+
+        def _raw_get(inv, *keys, default=""):
+            raw = getattr(inv, "raw_fields", {}) or {}
+            for k in keys:
+                v = raw.get(k)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s:
+                    return s
+            return default
+
+        specs = {}
+        export_opts = []
+
+        if (getattr(alt, "source", "") or "").strip().lower() == "inventory":
+            itemnum = (getattr(alt, "internal_part_number", "") or "").strip()
+            inv = None
+            if itemnum:
+                inv = self._inv_by_itemnum.get(itemnum)
+            inv = inv or getattr(alt, "raw", None)
+
+            if inv is not None:
+                seen = set()
+                def add_mpn(m):
+                    m = (m or "").strip()
+                    if not m:
+                        return
+                    k = m.lower()
+                    if k in seen:
+                        return
+                    seen.add(k)
+                    export_opts.append(m)
+
+                # Build export options strictly from the CPN/inventory grouping truth.
+                # Do NOT seed from alt.manufacturer_part_number because it may still hold
+                # the BOM MPN before the user explicitly chooses an export MFG PN.
+                base_vendoritem = (getattr(inv, "vendoritem", "") or "").strip() or _raw_get(inv, "vendoritem", "vendor_item", "mfgpn")
+                add_mpn(base_vendoritem)
+
+                # grouped aliases stamped during candidate collapsing (if any)
+                for m in list((getattr(alt, "meta", {}) or {}).get("company_pn_mfgpns", []) or []):
+                    add_mpn(m)
+
+                # master substitutes on inventory object
+                for s in (getattr(inv, "substitutes", None) or []):
+                    if isinstance(s, str):
+                        add_mpn(s)
+                    else:
+                        add_mpn(getattr(s, "mfgpn", "") or getattr(s, "manufacturer_part_number", "") or "")
+
+                # determine the selected/export MFG PN shown in the specs field.
+                current_selected = (getattr(alt, "manufacturer_part_number", "") or "").strip()
+                if current_selected and current_selected.lower() in seen:
+                    selected_vendoritem = current_selected
+                else:
+                    # fall back to controller-persisted explicit preference, if valid
+                    pref = str(((getattr(node, 'explain', {}) or {}).get('preferred_inventory_mfgpn') or '')).strip()
+                    if pref and pref.lower() in seen:
+                        selected_vendoritem = pref
+                    else:
+                        selected_vendoritem = base_vendoritem or (export_opts[0] if export_opts else "")
+
+                specs = {
+                    "ItemNumber": (getattr(inv, "itemnum", "") or "").strip() or _raw_get(inv, "itemnum", "item_number", "itemnumber"),
+                    "VendorItem": selected_vendoritem,
+                    "Description": (getattr(inv, "desc", "") or "").strip() or _raw_get(inv, "desc", "description"),
+                    "MfgName": (getattr(inv, "mfgname", "") or "").strip() or _raw_get(inv, "mfgname", "manufacturer_name"),
+                    "MfgId": (getattr(inv, "mfgid", "") or "").strip() or _raw_get(inv, "mfgid", "manufacturer_id"),
+                    "PrimaryVendorNumber": _raw_get(inv, "primaryvendornumber", "supplier", "vendor"),
+                    "TotalQty": _raw_get(inv, "totalqty", "total_qty", "qty_on_hand", "on_hand", "quantity"),
+                    "LastCost": _raw_get(inv, "lastcost", "last_cost"),
+                    "AvgCost": _raw_get(inv, "avgcost", "avg_cost", "average_cost"),
+                    "ItemLeadTime": _raw_get(inv, "itemleadtime", "item_lead_time", "lead_time"),
+                    "DefaultWhse": _raw_get(inv, "defaultwhse", "default_whse", "warehouse"),
+                    "TariffCodeHTSUS": _raw_get(inv, "tariffcodehtsus", "htsus", "tariff_code"),
+                }
+
+                if export_opts:
+                    specs["AlternatesCount"] = str(len(export_opts))
+                    specs["AlternatesList"] = "\n".join(export_opts)
+            else:
+                specs = {
+                    "ItemNumber": (getattr(alt, "internal_part_number", "") or "").strip(),
+                    "VendorItem": (getattr(alt, "manufacturer_part_number", "") or "").strip(),
+                    "Description": (getattr(alt, "description", "") or "").strip(),
+                }
+        else:
+            specs = {
+                "ItemNumber": (getattr(alt, "internal_part_number", "") or "").strip(),
+                "VendorItem": (getattr(alt, "manufacturer_part_number", "") or "").strip(),
+                "Description": (getattr(alt, "description", "") or "").strip(),
+                "MfgName": (getattr(alt, "manufacturer", "") or "").strip(),
+                "TotalQty": getattr(alt, "stock", None),
+                "AvgCost": getattr(alt, "unit_cost", None),
+                "PrimaryVendorNumber": (getattr(alt, "supplier", "") or "").strip(),
+            }
+
+        return {"specs": specs, "export_mfgpn_options": export_opts}
 
     # ----------------------------
     # External search (DigiKey etc.)
