@@ -1,31 +1,6 @@
-# same 3 panelization and split screen idea: upper scrollable panel, middle header panel, bottom split panel (left shows all matches to rect or accept) (right shows all infromaiton reguarding that part number hovered over on the left)
-# big change: replace tkinter with customtkinter gui control.
-# need to specify the inputs and utputs of the GUI
-# the GUI is populated from the controller. the controller is a sperate python file
-# It will be prepopulated with nothing from the database. Upon loading of the ERP inventory, Master invetory, BOM, then clicking RUN MATCHING the program will start and all elements will be populated
-# The UI will be populated from the data base based on selctions from a drop down whihc allows "workspace" selcetions. all informaiton fromt he database will be populated (related to worksapce)
-# The UI will have a button to lcick to export the BOM and NPR files
-# becuase the UI is dynamic and is treate  as a worksapce, it WILL be adding and removing things from the database (calling functions from the controller to do that)
+#new testing UI and decsion controller logic utilizing an SQL DB and a different ui python package to make it look more sleek.
+# alot of things are broken still heavily in development from the old UI
 
-# This should be failry intuitive and easy to rework, we are simply building a GUI and all of its buttons simply call the a controller function.
-
-
-# The controller is going to be difficult to handle now as it has many jobs. but the base line is: it will handle all buttons and funcitlities of the UI in order to populate the UI
-# The contoller will grab information from the Database (querying) AND change values inside of the data base.
-# The controller Will at one point call the matching engine. The matching engine is needed for core fucnitnilty (the biggest concern of the program)
-# the infromation fromt he matching engine will be PASSED to the controller. the controller will then make changes to the database correspondingly.
-# The controller is responsible for building the NPR workspace.
-# the controller at no point operates under the scope of the dataloader, the parsing engine, the matching engine, or creation of UI elements themselves. right now, it does all of that.
-
-# this should also be failry inituitive now that we know what the scope of the UI is. It's a large file, that acts kinda like an api for the ui (indicvidual files get called on by the ui)
-
-
-# the matching engine needs to be rechecked in terms of how it interactes withthe database. right now it SHOULD BE a box (get static input, give processed output)
-# anything that changing in the matching enigine should not effect the inputs and output. The inputs to the matching engine should be provided by the controller and ONLY the controller. 
-
-
-
-# ui/ctk_workspace_ui.py
 from __future__ import annotations
 
 import threading
@@ -69,9 +44,8 @@ class DecisionWorkspaceCTK:
         self._pin_click_guard_alt = None
         self._pin_click_guard_until = 0
 
-        # ---- theme/colors (keep your palette; tweak later) ----
         self.COLORS = {
-            "bg_main": "#0B1220",     # darker modern background
+            "bg_main": "#0B1220",    
             "card_bg": "#0F172A",
             "card_border": "#243046",
             "text": "#E5E7EB",
@@ -239,13 +213,13 @@ class DecisionWorkspaceCTK:
         self.h_meta = ctk.CTkLabel(parent, text="", text_color=self.COLORS["primary"], font=ctk.CTkFont(size=14, weight="bold"))
         self.h_meta.pack(pady=(0, 10))
 
-        # PN row (we’ll port your editor behavior next)
         pn_row = ctk.CTkFrame(parent, fg_color="transparent")
         pn_row.pack(pady=(0, 10))
 
         self.suggested_var = tk.StringVar(value="")
         self.company_pn_var = tk.StringVar(value="")
 
+        self.desc_var = tk.StringVar(value='')
         ctk.CTkLabel(pn_row, text="Suggested CNS:", text_color="#CBD5E1").pack(side="left", padx=(0, 8))
         self.suggested_entry = ctk.CTkEntry(pn_row, width=160, textvariable=self.suggested_var)
         self.suggested_entry.configure(state="readonly")
@@ -258,6 +232,29 @@ class DecisionWorkspaceCTK:
         self.apply_pn_btn = ctk.CTkButton(pn_row, text="Apply", command=self._apply_company_pn, width=80)
         self.apply_pn_btn.pack(side="left", padx=(0, 10))
 
+        # Company BOM section (drives formatted BOM export bucket)
+        self.bom_section_var = tk.StringVar(value="SURFACE MOUNT")
+        self._suspend_bom_section_event = False
+        ctk.CTkLabel(pn_row, text="BOM Section:", text_color="#CBD5E1").pack(side="left", padx=(8, 6))
+        self.bom_section_menu = ctk.CTkOptionMenu(
+            pn_row,
+            width=220,
+            variable=self.bom_section_var,
+            values=["SURFACE MOUNT", "THROUGH-HOLE", "AUXILIARY - ASSEMBLY", "AUXILIARY - MECH", "AUXILIARY - PRODUCTION", "AUXILIARY - OTHER"],
+            command=self._on_bom_section_changed,
+        )
+        self.bom_section_menu.pack(side="left", padx=(0, 8))
+
+        # Description override (affects export + right panel; persisted in DB via controller)
+        desc_row = ctk.CTkFrame(parent, fg_color="transparent")
+        desc_row.pack(pady=(0, 10), fill="x")
+        ctk.CTkLabel(desc_row, text="Description:", text_color="#CBD5E1").pack(side="left", padx=(0, 8))
+        self.desc_entry = ctk.CTkEntry(desc_row, width=720, textvariable=self.desc_var)
+        self.desc_entry.pack(side="left", padx=(0, 10))
+        self.apply_desc_btn = ctk.CTkButton(desc_row, text="Update Desc", command=self._apply_description, width=140)
+        self.apply_desc_btn.pack(side="left")
+
+
         btn_row = ctk.CTkFrame(parent, fg_color="transparent")
         btn_row.pack(pady=(0, 14))
 
@@ -265,7 +262,17 @@ class DecisionWorkspaceCTK:
         self.mark_ready_btn.pack(side="left", padx=(0, 8))
 
         self.unmark_ready_btn = ctk.CTkButton(btn_row, text="Unmark Ready", command=self._on_unmark_ready, width=140, fg_color="#374151", hover_color="#4B5563")
-        self.unmark_ready_btn.pack(side="left")
+        self.unmark_ready_btn.pack(side="left", padx=(0, 8))
+
+        self.auto_reject_btn = ctk.CTkButton(
+            btn_row,
+            text="Auto Reject All",
+            command=self._on_auto_reject_all,
+            width=150,
+            fg_color="#7F1D1D",
+            hover_color="#991B1B",
+        )
+        self.auto_reject_btn.pack(side="left")
 
     def _build_bottom_panes(self, parent: ctk.CTkFrame):
         parent.grid_rowconfigure(0, weight=1)
@@ -328,6 +335,10 @@ class DecisionWorkspaceCTK:
         self.h_title.configure(text="No Selection")
         self.h_desc.configure(text="")
         self.h_meta.configure(text="Select a BOM line")
+        try:
+            self.auto_reject_btn.configure(state="disabled")
+        except Exception:
+            pass
 
         for w in self.cards_scroll.winfo_children():
             w.destroy()
@@ -376,7 +387,7 @@ class DecisionWorkspaceCTK:
             )
 
     # ---------------------------------------------------------------------
-    # Event handlers (wire to your existing controller methods)
+    # Event handlers 
     # ---------------------------------------------------------------------
     def _on_node_select(self, _e=None):
         if getattr(self, "_suspend_node_select", False):
@@ -394,6 +405,10 @@ class DecisionWorkspaceCTK:
 
         self.current_node_id = node_id
         try:
+            self.desc_var.set(getattr(node, 'description', '') or '')
+        except Exception:
+            pass
+        try:
             alts = list(getattr(node, "alternates", []) or [])
             picked = next((a for a in alts if getattr(a, "selected", False) and not getattr(a, "rejected", False)), None)
             self._pinned_alt_id = getattr(picked, "id", None) if picked else None
@@ -410,6 +425,14 @@ class DecisionWorkspaceCTK:
 
         self.suggested_var.set((getattr(node, "suggested_pb", "") or "").strip())
         self.company_pn_var.set((getattr(node, "assigned_part_number", "") or getattr(node, "internal_part_number", "") or "").strip())
+        try:
+            self._suspend_bom_section_event = True
+            sec = self.controller.get_node_bom_section(node.id)
+            self.bom_section_var.set(sec or "SURFACE MOUNT")
+        except Exception:
+            self.bom_section_var.set("SURFACE MOUNT")
+        finally:
+            self._suspend_bom_section_event = False
 
         locked = bool(getattr(node, 'locked', False))
         try:
@@ -417,6 +440,9 @@ class DecisionWorkspaceCTK:
             self.unmark_ready_btn.configure(state=("normal" if locked else "disabled"))
             self.apply_pn_btn.configure(state=("disabled" if locked else "normal"))
             self.company_pn_entry.configure(state=("disabled" if locked else "normal"))
+            self.bom_section_menu.configure(state="normal")
+            # Auto reject should always be usable when a node is selected
+            self.auto_reject_btn.configure(state="normal")
         except Exception:
             pass
 
@@ -472,21 +498,28 @@ class DecisionWorkspaceCTK:
             ctk.CTkLabel(section, text="None", text_color=self.COLORS["text_dim"]).pack(anchor="w", padx=12, pady=(0, 8))
             return
 
-        grid = ctk.CTkFrame(section, fg_color="transparent")
-        grid.pack(fill="x", padx=8, pady=(0, 8))
+        # Masonry-style columns (instead of a row/column grid) to avoid row-height whitespace.
+        # In a normal grid, one tall card forces extra empty space in the neighboring card.
+        holder = ctk.CTkFrame(section, fg_color="transparent")
+        holder.pack(fill="x", padx=8, pady=(0, 8))
+
         cols = 2
         try:
             width = max(600, int(self.cards_host.winfo_width() or 600))
             cols = 1 if width < 900 else 2
         except Exception:
             cols = 2
+
+        col_frames = []
         for c in range(cols):
-            grid.grid_columnconfigure(c, weight=1)
+            cf = ctk.CTkFrame(holder, fg_color="transparent")
+            cf.pack(side="left", fill="x", expand=True)
+            col_frames.append(cf)
 
         for i, alt in enumerate(alternates):
-            r, c = divmod(i, cols)
+            target = col_frames[i % cols]
             card = self._create_card(node, alt)
-            card.grid(row=r, column=c, sticky="ew", padx=6, pady=6, in_=grid)
+            card.pack(in_=target, fill="x", padx=6, pady=6, anchor="n")
 
     def _create_card(self, node: DecisionNode, alt: Alternate):
         is_rejected = bool(getattr(alt, "rejected", False))
@@ -501,9 +534,17 @@ class DecisionWorkspaceCTK:
         elif is_pinned:
             border = self.COLORS["primary"]
 
-        outer = ctk.CTkFrame(self.cards_scroll, corner_radius=12, fg_color=border)
-        inner = ctk.CTkFrame(outer, corner_radius=10, fg_color=self.COLORS["card_bg"])
-        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        outer = ctk.CTkFrame(self.cards_scroll, corner_radius=12, fg_color=border, height=1)
+        try:
+            outer.pack_propagate(True)
+        except Exception:
+            pass
+        inner = ctk.CTkFrame(outer, corner_radius=10, fg_color=self.COLORS["card_bg"], height=1)
+        try:
+            inner.pack_propagate(True)
+        except Exception:
+            pass
+        inner.pack(fill="x", expand=False, padx=1, pady=1)
 
         head = ctk.CTkFrame(inner, fg_color="transparent")
         head.pack(fill="x", padx=10, pady=(8, 4))
@@ -537,6 +578,9 @@ class DecisionWorkspaceCTK:
                      fg_color="#1E3A8A", text_color="white").pack(side="right")
 
         desc = (getattr(alt, "description", "") or "").strip() or "(no description)"
+        # Keep card heights compact/smoother by clamping very long descriptions on the card.
+        if len(desc) > 180:
+            desc = desc[:177].rstrip() + "..."
         ctk.CTkLabel(inner, text=desc, wraplength=520, justify="left",
                      text_color=self.COLORS["text_dim"]).pack(anchor="w", padx=10, pady=(0, 6))
 
@@ -584,7 +628,7 @@ class DecisionWorkspaceCTK:
             try:
                 # Do NOT bind focus-click onto the action row (buttons) or buttons themselves.
                 if (widget is not row) and (not isinstance(widget, ctk.CTkButton)):
-                    widget.bind("<Button-1>", lambda _e, a=alt: self._pin_card(node, a))
+                    widget.bind("<Button-1>", lambda _e=None, a=alt: self._pin_card(node, a))
             except Exception:
                 pass
             # Skip the action-row subtree entirely so button clicks never pin/focus the card.
@@ -677,7 +721,7 @@ class DecisionWorkspaceCTK:
             box.insert("1.0", val)
             box.configure(state="disabled")
             try:
-                box.bind("<Button-1>", lambda _e, t=val, l=label: self._copy_to_clipboard(t, toast=f"Copied {l}"))
+                box.bind("<Button-1>", lambda _e=None, t=val, l=label: self._copy_to_clipboard(t, toast=f"Copied {l}"))
             except Exception:
                 pass
 
@@ -955,6 +999,31 @@ class DecisionWorkspaceCTK:
 
         ctk.CTkButton(win, text='Open', command=do_open).pack(pady=(0,10))
 
+    def _copy_to_clipboard(self, text, toast=None):
+        try:
+            s = "" if text is None else str(text)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(s)
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
+            if toast:
+                try:
+                    self.status_var.set(str(toast))
+                except Exception:
+                    pass
+        except Exception as e:
+            messagebox.showerror("Copy Failed", str(e))
+
+    def _set_status(self, msg: str, ok: bool = True):
+        try:
+            if hasattr(self, "status_var") and self.status_var is not None:
+                self.status_var.set(str(msg or ""))
+        except Exception:
+            pass
+
+
     def _save_workspace(self):
         try:
             self.controller.flush_workspace_to_db()
@@ -985,6 +1054,27 @@ class DecisionWorkspaceCTK:
         except Exception as e:
             messagebox.showerror("Export Failed", str(e))
 
+    def _on_bom_section_changed(self, _choice=None):
+        if getattr(self, "_suspend_bom_section_event", False):
+            return
+        node_id = self.current_node_id
+        if not node_id:
+            return
+        try:
+            sec = self.controller.set_node_bom_section(node_id, self.bom_section_var.get())
+            self._suspend_bom_section_event = True
+            self.bom_section_var.set(sec)
+            self._suspend_bom_section_event = False
+            self._set_status(f"BOM section set to {sec}", ok=True)
+        except Exception as e:
+            self._suspend_bom_section_event = True
+            try:
+                self.bom_section_var.set(self.controller.get_node_bom_section(node_id))
+            except Exception:
+                pass
+            self._suspend_bom_section_event = False
+            messagebox.showerror("BOM Section Failed", str(e))
+
     def _apply_company_pn(self):
         if not self.current_node_id:
             return
@@ -1002,6 +1092,44 @@ class DecisionWorkspaceCTK:
         except Exception as e:
             messagebox.showerror("Apply PN Failed", str(e))
 
+
+    def _apply_description(self):
+        node_id = self.current_node_id
+        if not node_id:
+            return
+        desc = (self.desc_var.get() or "").strip()
+        try:
+            self.controller.set_node_description(node_id, desc)
+        except Exception as e:
+            self._set_status(f"Description update failed: {e}")
+            return
+
+        # Refresh current node views without flicker
+        try:
+            fresh = self.controller.get_node(node_id)
+            self._render_header_state(fresh)
+            self._render_cards(fresh)
+            # keep right panel on pinned alt if possible
+            if self._pinned_alt_id:
+                payload = self.controller.get_alt_detail_payload(node_id, self._pinned_alt_id)
+                self._render_specs(payload)
+            else:
+                # pick first active card
+                first = None
+                try:
+                    for a in (fresh.alternates or []):
+                        if not getattr(a, 'rejected', False):
+                            first = a
+                            break
+                except Exception:
+                    first = None
+                if first:
+                    payload = self.controller.get_alt_detail_payload(node_id, getattr(first,'id',None))
+                    self._render_specs(payload)
+            self._set_status("Description updated")
+        except Exception:
+            pass
+
     def _on_mark_ready(self):
         if not self.current_node_id:
             messagebox.showwarning("No Selection", "Select a node first.")
@@ -1014,6 +1142,35 @@ class DecisionWorkspaceCTK:
         except Exception as e:
             messagebox.showerror("Mark Ready Failed", str(e))
 
+
+    def _on_auto_reject_all(self):
+        if not self.current_node_id:
+            messagebox.showwarning("No Selection", "Select a node first.")
+            return
+        try:
+            node = self.controller.get_node(self.current_node_id)
+            if not node:
+                return
+            if getattr(node, "locked", False):
+                messagebox.showwarning("Node Locked", "Unmark Ready before rejecting alternates.")
+                return
+            alts = list(getattr(node, "alternates", []) or [])
+            todo = [a for a in alts if not getattr(a, "rejected", False)]
+            if not todo:
+                self.status_var.set("No active cards to reject.")
+                return
+            # batch controller updates, then single UI refresh for smoothness
+            for a in todo:
+                try:
+                    self.controller.reject_alternate(node.id, a.id)
+                except Exception:
+                    pass
+            self._pinned_alt_id = None
+            fresh = self._refresh_after_alt_action(node.id, focus_alt_id=None, refresh_table=True)
+            remaining = sum(1 for a in (getattr(fresh, 'alternates', []) or []) if not getattr(a, 'rejected', False)) if fresh else 0
+            self.status_var.set(f"Auto rejected cards for node {node.id}. Remaining active: {remaining}.")
+        except Exception as e:
+            messagebox.showerror("Auto Reject Failed", str(e))
 
     def _on_unmark_ready(self):
         if not self.current_node_id:

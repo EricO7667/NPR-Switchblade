@@ -241,6 +241,9 @@ class MatchingEngine:
         self._splade_doc_term_wts = None   # List[np.ndarray] (weights)
         self._splade_doc_hash = None       # inventory hash used for cache validation
 
+        # Exact Tier 1 export audit rows
+        self._exact_mfgpn_export_rows: List[Dict[str, Any]] = []
+
     #===================================================
     # HELPERS
     #===================================================
@@ -276,6 +279,43 @@ class MatchingEngine:
                 p.unlink()
         except Exception:
             pass
+
+    def reset_match_exports(self) -> None:
+        self._exact_mfgpn_export_rows = []
+
+    def export_exact_mfgpn_matches_txt(self, filepath: Optional[str] = None) -> str:
+        """
+        Export all Tier 1 exact manufacturer-part-number matches from the current run.
+
+        Returns the final file path written.
+        """
+        if filepath is None:
+            filepath = str(self.cache_dir / "exact_mfgpn_matches.txt")
+
+        p = Path(filepath)
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        rows = list(self._exact_mfgpn_export_rows or [])
+
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("EXACT MFGPN MATCH EXPORT\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"count: {len(rows)}\n\n")
+
+            for i, row in enumerate(rows, start=1):
+                f.write(f"[{i}]\n")
+                f.write(f"NPR Part Number        : {row.get('npr_partnum', '')}\n")
+                f.write(f"NPR MFGPN Raw          : {row.get('npr_mfgpn_raw', '')}\n")
+                f.write(f"NPR MFGPN Normalized   : {row.get('npr_mfgpn_norm', '')}\n")
+                f.write(f"Inventory Item Number  : {row.get('inventory_itemnum', '')}\n")
+                f.write(f"Inventory Vendor MPN   : {row.get('inventory_vendor_mpn_raw', '')}\n")
+                f.write(f"Inventory Vendor Norm  : {row.get('inventory_vendor_mpn_norm', '')}\n")
+                f.write(f"Inventory Description  : {row.get('inventory_desc', '')}\n")
+                f.write(f"Candidate Count        : {row.get('candidate_count', 0)}\n")
+                f.write(f"Stock                  : {row.get('stock', 0)}\n")
+                f.write("-" * 80 + "\n")
+
+        return str(p)
 
     #outsource Parsing to the parsing engine instead
     def _inv_fingerprint(self) -> str:
@@ -1104,9 +1144,21 @@ class MatchingEngine:
         return (getattr(inv, "itemnum", None) or "").strip()
     
     def _norm_mpn(self, s: str) -> str:
-        # normalize like your loader: uppercase + remove whitespace
+        """
+        Normalize manufacturer part numbers for deterministic matching.
+
+        Current intent:
+        - uppercase
+        - remove whitespace
+        - remove common visual separators that should not change identity
+          (dash, underscore, slash, backslash, period)
+        """
         s = (s or "").strip().upper()
+        if not s:
+            return ""
+
         s = re.sub(r"\s+", "", s)
+        s = re.sub(r"[-_/\\.]", "", s)
         return s
 
     def _inv_desc(self, inv: Any) -> str:
@@ -1183,22 +1235,54 @@ class MatchingEngine:
     # Other tiers 
     # =====================================================
     def _match_by_mfgpn(self, npr: NPRPart) -> Optional[MatchResult]:
-        needle = npr.mfgpn.upper().strip()
-        hits = [
-            inv for inv in self.inventory
-            if inv.vendoritem and inv.vendoritem.upper().strip() == needle
-        ]
+        needle_raw = (getattr(npr, "mfgpn", None) or "").strip()
+        needle = self._norm_mpn(needle_raw)
+        if not needle:
+            return None
+
+        hits = []
+        for inv in self.inventory:
+            vendor_raw = (getattr(inv, "vendoritem", None) or "").strip()
+            vendor_norm = self._norm_mpn(vendor_raw)
+            if vendor_norm and vendor_norm == needle:
+                hits.append(inv)
+
         if not hits:
             return None
 
         best = max(hits, key=lambda inv: getattr(inv, "stock", 0) or 0)
+
+        try:
+            self._exact_mfgpn_export_rows.append({
+                "npr_partnum": (getattr(npr, "partnum", None) or "").strip(),
+                "npr_mfgpn_raw": needle_raw,
+                "npr_mfgpn_norm": needle,
+                "inventory_itemnum": self._inv_item(best),
+                "inventory_vendor_mpn_raw": (getattr(best, "vendoritem", None) or "").strip(),
+                "inventory_vendor_mpn_norm": self._norm_mpn(getattr(best, "vendoritem", None) or ""),
+                "inventory_desc": self._inv_desc(best),
+                "candidate_count": len(hits),
+                "stock": int(getattr(best, "stock", 0) or 0),
+            })
+        except Exception:
+            pass
+
         return MatchResult(
             match_type=MatchType.EXACT_MFG_PN,
             confidence=self.confidence_weights[MatchType.EXACT_MFG_PN],
             inventory_part=best,
             candidates=hits,
             notes=f"Matched by exact Manufacturer Part # ({len(hits)} candidates)",
-            explain={"tier": "exact_mfgpn", "candidate_count": len(hits)},
+            explain={
+                "tier": "exact_mfgpn",
+                "candidate_count": len(hits),
+                "needle_raw": needle_raw,
+                "needle_norm": needle,
+                "matched_vendor_mpns": [
+                    (getattr(inv, "vendoritem", None) or "").strip()
+                    for inv in hits[:25]
+                ],
+            },
         )
 
     def _match_by_prefix(self, npr: NPRPart) -> Optional[MatchResult]:

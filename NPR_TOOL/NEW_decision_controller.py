@@ -926,7 +926,7 @@ class DecisionController:
                 locked=False,
 
                 notes=str(r.get("notes", "") or ""),
-                explain=r.get("explain_json") or {},
+                explain={},
             )
 
             # ---------------------------------------------------------
@@ -2514,6 +2514,7 @@ class DecisionController:
         self._persist_node_and_alts(node)
 
 
+
     def get_alt_detail_payload(self, node_id: str, alt_id: str) -> dict:
         """
         Controller-backed detail payload for the UI (DB/controller is the truth).
@@ -2523,16 +2524,38 @@ class DecisionController:
         node = self.get_node(node_id)
         alt = self._find_alt(node, alt_id)
 
-        def _raw_get(inv, *keys, default=""):
-            raw = getattr(inv, "raw_fields", {}) or {}
+        def _raw_get(obj, *keys, default=""):
+            if obj is None:
+                return default
+            raw = getattr(obj, "raw_fields", {}) or {}
+            if isinstance(raw, dict):
+                for k in keys:
+                    v = raw.get(k)
+                    if v is None:
+                        continue
+                    s = str(v).strip()
+                    if s:
+                        return s
+            # fallback: direct attrs
             for k in keys:
-                v = raw.get(k)
+                v = getattr(obj, k, None)
                 if v is None:
                     continue
                 s = str(v).strip()
                 if s:
                     return s
             return default
+
+        def _pick_sub_field(sub_obj, *keys):
+            # Try common direct attrs first, then raw_fields aliases.
+            for k in keys:
+                v = getattr(sub_obj, k, None)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s:
+                    return s
+            return _raw_get(sub_obj, *keys, default="")
 
         specs = {}
         export_opts = []
@@ -2546,6 +2569,7 @@ class DecisionController:
 
             if inv is not None:
                 seen = set()
+
                 def add_mpn(m):
                     m = (m or "").strip()
                     if not m:
@@ -2556,46 +2580,83 @@ class DecisionController:
                     seen.add(k)
                     export_opts.append(m)
 
-                # Build export options strictly from the CPN/inventory grouping truth.
-                # Do NOT seed from alt.manufacturer_part_number because it may still hold
-                # the BOM MPN before the user explicitly chooses an export MFG PN.
+                # Build export options strictly from company-part grouping truth.
                 base_vendoritem = (getattr(inv, "vendoritem", "") or "").strip() or _raw_get(inv, "vendoritem", "vendor_item", "mfgpn")
                 add_mpn(base_vendoritem)
 
-                # grouped aliases stamped during candidate collapsing (if any)
+                # grouped aliases stamped during candidate collapsing
                 for m in list((getattr(alt, "meta", {}) or {}).get("company_pn_mfgpns", []) or []):
                     add_mpn(m)
 
-                # master substitutes on inventory object
-                for s in (getattr(inv, "substitutes", None) or []):
+                # inventory substitutes
+                subs = list(getattr(inv, "substitutes", None) or [])
+                for s in subs:
                     if isinstance(s, str):
                         add_mpn(s)
                     else:
-                        add_mpn(getattr(s, "mfgpn", "") or getattr(s, "manufacturer_part_number", "") or "")
+                        add_mpn(getattr(s, "mfgpn", "") or getattr(s, "manufacturer_part_number", "") or _pick_sub_field(s, "mfgpn", "vendoritem", "vendor_item"))
 
-                # determine the selected/export MFG PN shown in the specs field.
+                # selected export MFG PN (must be valid under this CPN)
                 current_selected = (getattr(alt, "manufacturer_part_number", "") or "").strip()
                 if current_selected and current_selected.lower() in seen:
                     selected_vendoritem = current_selected
                 else:
-                    # fall back to controller-persisted explicit preference, if valid
-                    pref = str(((getattr(node, 'explain', {}) or {}).get('preferred_inventory_mfgpn') or '')).strip()
+                    pref = str(((getattr(node, "explain", {}) or {}).get("preferred_inventory_mfgpn") or "")).strip()
                     if pref and pref.lower() in seen:
                         selected_vendoritem = pref
                     else:
                         selected_vendoritem = base_vendoritem or (export_opts[0] if export_opts else "")
 
+                # If the selected vendor item corresponds to a substitute object, surface THAT
+                # substitute's details in the panel (description/manufacturer/etc.).
+                selected_sub = None
+                if selected_vendoritem:
+                    sv = selected_vendoritem.strip().lower()
+                    for s in subs:
+                        if isinstance(s, str):
+                            continue
+                        smpn = (getattr(s, "mfgpn", "") or getattr(s, "manufacturer_part_number", "") or _pick_sub_field(s, "mfgpn", "vendoritem", "vendor_item")).strip()
+                        if smpn and smpn.lower() == sv:
+                            selected_sub = s
+                            break
+
+                # Base values from the inventory/company item row
+                desc_val = (getattr(inv, "desc", "") or "").strip() or _raw_get(inv, "desc", "description")
+                mfg_name_val = (getattr(inv, "mfgname", "") or "").strip() or _raw_get(inv, "mfgname", "manufacturer_name")
+                mfg_id_val = (getattr(inv, "mfgid", "") or "").strip() or _raw_get(inv, "mfgid", "manufacturer_id")
+                supplier_val = _raw_get(inv, "primaryvendornumber", "supplier", "vendor")
+                last_cost_val = _raw_get(inv, "lastcost", "last_cost")
+                avg_cost_val = _raw_get(inv, "avgcost", "avg_cost", "average_cost")
+                lead_val = _raw_get(inv, "itemleadtime", "item_lead_time", "lead_time")
+
+                # Override with substitute details when available for the selected alternate MPN
+                if selected_sub is not None:
+                    desc_val = _pick_sub_field(selected_sub, "description", "desc") or desc_val
+                    mfg_name_val = _pick_sub_field(selected_sub, "manufacturer", "mfgname", "manufacturer_name") or mfg_name_val
+                    mfg_id_val = _pick_sub_field(selected_sub, "mfgid", "manufacturer_id") or mfg_id_val
+                    supplier_val = _pick_sub_field(selected_sub, "supplier", "vendor", "primaryvendornumber") or supplier_val
+                    # cost fields vary by source naming
+                    avg_cost_val = (
+                        _pick_sub_field(selected_sub, "unit_cost", "avgcost", "avg_cost", "price")
+                        or avg_cost_val
+                    )
+                    last_cost_val = (
+                        _pick_sub_field(selected_sub, "lastcost", "last_cost", "unit_cost", "price")
+                        or last_cost_val
+                    )
+                    lead_val = _pick_sub_field(selected_sub, "lead_time", "itemleadtime", "item_lead_time") or lead_val
+
                 specs = {
                     "ItemNumber": (getattr(inv, "itemnum", "") or "").strip() or _raw_get(inv, "itemnum", "item_number", "itemnumber"),
                     "VendorItem": selected_vendoritem,
-                    "Description": (getattr(inv, "desc", "") or "").strip() or _raw_get(inv, "desc", "description"),
-                    "MfgName": (getattr(inv, "mfgname", "") or "").strip() or _raw_get(inv, "mfgname", "manufacturer_name"),
-                    "MfgId": (getattr(inv, "mfgid", "") or "").strip() or _raw_get(inv, "mfgid", "manufacturer_id"),
-                    "PrimaryVendorNumber": _raw_get(inv, "primaryvendornumber", "supplier", "vendor"),
+                    "Description": desc_val,
+                    "MfgName": mfg_name_val,
+                    "MfgId": mfg_id_val,
+                    "PrimaryVendorNumber": supplier_val,
                     "TotalQty": _raw_get(inv, "totalqty", "total_qty", "qty_on_hand", "on_hand", "quantity"),
-                    "LastCost": _raw_get(inv, "lastcost", "last_cost"),
-                    "AvgCost": _raw_get(inv, "avgcost", "avg_cost", "average_cost"),
-                    "ItemLeadTime": _raw_get(inv, "itemleadtime", "item_lead_time", "lead_time"),
+                    "LastCost": last_cost_val,
+                    "AvgCost": avg_cost_val,
+                    "ItemLeadTime": lead_val,
                     "DefaultWhse": _raw_get(inv, "defaultwhse", "default_whse", "warehouse"),
                     "TariffCodeHTSUS": _raw_get(inv, "tariffcodehtsus", "htsus", "tariff_code"),
                 }
@@ -2603,29 +2664,21 @@ class DecisionController:
                 if export_opts:
                     specs["AlternatesCount"] = str(len(export_opts))
                     specs["AlternatesList"] = "\n".join(export_opts)
-            else:
-                specs = {
-                    "ItemNumber": (getattr(alt, "internal_part_number", "") or "").strip(),
-                    "VendorItem": (getattr(alt, "manufacturer_part_number", "") or "").strip(),
-                    "Description": (getattr(alt, "description", "") or "").strip(),
-                }
+
         else:
+            # Non-inventory alt fallback details
             specs = {
                 "ItemNumber": (getattr(alt, "internal_part_number", "") or "").strip(),
                 "VendorItem": (getattr(alt, "manufacturer_part_number", "") or "").strip(),
                 "Description": (getattr(alt, "description", "") or "").strip(),
                 "MfgName": (getattr(alt, "manufacturer", "") or "").strip(),
-                "TotalQty": getattr(alt, "stock", None),
-                "AvgCost": getattr(alt, "unit_cost", None),
                 "PrimaryVendorNumber": (getattr(alt, "supplier", "") or "").strip(),
+                "TotalQty": "" if getattr(alt, "stock", None) in (None, "") else str(getattr(alt, "stock", "")),
+                "AvgCost": "" if getattr(alt, "unit_cost", None) in (None, "") else str(getattr(alt, "unit_cost", "")),
             }
 
         return {"specs": specs, "export_mfgpn_options": export_opts}
 
-    # ----------------------------
-    # External search (DigiKey etc.)
-    # ----------------------------
-#------------------------------------
     def search_digikey(self, node_id: str) -> List[Alternate]:
         """
         Cache is controller-owned (not UI). UI just calls this.
