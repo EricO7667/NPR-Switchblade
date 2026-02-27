@@ -52,25 +52,7 @@ External lookup support has been a goal since the beginning of the project.
 - Semi-automated alternate and substitute part discovery
 - Intended to further reduce manual NPR and BOM processing time
 
----
 
-## Testing & Current Results
-
-- Current testing shows **high accuracy for inventory part number matching**
-- Description-based matching still produces a higher miss rate due to:
-  - Inconsistent customer BOM descriptions
-  - Non-normalized inventory description schemas
-
-### Known Improvements
-
-- Inventory description schemas should be normalized to reduce lookup misses
-- Description matching performance is expected to improve significantly once standardized
-
-### Example Result
-
-- A **51-part BOM** was scrubbed and converted into an **NPR/BOM (single-sourced)** in **~4 days**
-- This was achieved despite known limitations in the current version
-- Even at this stage, the tool has already demonstrated SOME time savings
 
 ---
 
