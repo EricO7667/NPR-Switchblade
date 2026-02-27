@@ -248,7 +248,6 @@ class MatchingEngine:
     # HELPERS
     #===================================================
     def _trace_path(self):
-        # keep trace next to your caches
         return (self.cache_dir / ENG_TRACE_PATH)
 
     def _trace_write(self, rec: dict) -> None:
@@ -272,7 +271,6 @@ class MatchingEngine:
 
 
     def trace_reset(self) -> None:
-        """Call this before a run if you want a clean file."""
         try:
             p = self._trace_path()
             if p.exists():
@@ -477,7 +475,7 @@ class MatchingEngine:
                 print(f"[SPLADE] failed to load doc cache: {e}")
             return False
 
-    # Splade cahching works, but an issue with it is that unlike the embeded, any change to the input BOM changes cuases a complete reworking of th esplade model, meaning we have to wait or all 5000+ splade thingies to do things
+    # Splade cahching works, but an issue with it is that unlike the embeded, any change to the input BOM changes cuases a complete reworking of th esplade model, meaning have to wait or all 5000+ splade thingies to do things
     def _save_splade_doc_cache(self) -> None:
         if not ENG_SPARSE_CACHE_ENABLE:
             return
@@ -760,7 +758,7 @@ class MatchingEngine:
     # =====================================================
 
     #TODO: concern needed to address for scalability
-    # fix ptype hard gating. a big issue is that way we match part types is a limitiing factor, as if th epart type is incorrect downstream issues will occure in the matching. 
+    # fix ptype hard gating. a big issue is that way match part types is a limitiing factor, as if th epart type is incorrect downstream issues will occure in the matching. 
     # this needs ot be reworded and better logic reguarding searchign thogh the CNS needs to be resovled beofre hand before applying matching p types. 
 
     # ptype matching may be hindering the process here. cardcodign any values like res cap ind or diode is the wrong implementation and all of this should be removed.
@@ -768,7 +766,7 @@ class MatchingEngine:
 
     # there are truths and non truths in all of this:
     # 1: The CNS provides to us a number catergoization of types 1-99. Each invnetory item will need to explicitly be matched with its ptype (easy to do, the company part number prefix TELLS us what part it belongs under)
-    # 2: in the matching logic, when given a part number from a BOM, we need to attach a ptype match to each part SOMEHOW. then when comparing against the inventory, we need to make sure that ptypes match (lowering the pool of data it needs to sluth through reducing error margins)
+    # 2: in the matching logic, when given a part number from a BOM, need to attach a ptype match to each part SOMEHOW. then when comparing against the inventory, need to make sure that ptypes match (lowering the pool of data it needs to sluth through reducing error margins)
 
     def _ptype_signal(self, obj: Any) -> Dict[str, Any]:
         """
@@ -780,13 +778,11 @@ class MatchingEngine:
           }
 
         Notes:
-        - We treat OTHER as "unknown-ish": do NOT hard-gate on it.
+        - treat OTHER as "unknown-ish": do NOT hard-gate on it.
         - If CNS (or other authoritative upstream) provides a type, it wins.
         """
         p = self._safe_get_parsed(obj)
 
-        # 1) Authoritative hint (optional): if you ever attach CNS-derived type to parsed
-        #    e.g. p["cns_type"] = "CAP", treat as highest confidence.
         raw = (p.get("cns_type") or p.get("type") or p.get("component") or p.get("kind") or "")
         raw_u = str(raw).strip().upper()
 
@@ -905,7 +901,7 @@ class MatchingEngine:
         n_type = self._ptype(npr_p)  # bucket only: RESISTOR/CAPACITOR/INDUCTOR/DIODE/OTHER
         
 
-        # If we don't know the family, don't gate at all.
+        # If don't know the family, don't gate at all.
         if n_type == "OTHER":
             return list(candidates or [])
 
@@ -1333,8 +1329,7 @@ class MatchingEngine:
             return None
     
         # conflict handling: same MFGPN maps to multiple base parts.
-        # We still pick a deterministic "best" base (highest stock) to avoid inflating UI cards,
-        # but we preserve the conflict list in explain so you can audit it.
+        # still pick a deterministic "best" base (highest stock) to avoid inflating UI cards,
         if key in self._sub_mpn_conflicts:
             inv = self._sub_mpn_index.get(key)
             return MatchResult(
@@ -1596,7 +1591,7 @@ class MatchingEngine:
 
         # ---- TRACE FIX #2: store secondary under explicit stage name ("dense" or "sparse") ----
         # Important: primary already wrote one of dense/sparse/fuzzy; secondary writes the OTHER signal.
-        # If it happens to match the same name (shouldn't in normal dense<->sparse), we suffix it to avoid overwriting.
+        # If it happens to match the same name (shouldn't in normal dense<->sparse),suffix it to avoid overwriting.
         if secondary_label in ("dense", "sparse"):
             stage_secondary_name = secondary_label
             if stage_secondary_name in trace["stages"]:
@@ -1648,7 +1643,6 @@ class MatchingEngine:
         for inv, seed in zip(candidates, hybrid):
             inv._pc_seed = float(seed)
 
-        # candidates_idx aligns with hybrid before you sort candidates
         topn = min(int(ENG_TRACE_TOPN), len(candidates_idx))
         trace["stages"]["hybrid_seed"] = {
             "count": len(candidates_idx),
@@ -1793,7 +1787,6 @@ class MatchingEngine:
     # Tier 4 — API Match (future)
     # =====================================================
     def _match_by_api_data(self, npr: NPRPart) -> Optional[MatchResult]:
-        # This tier exists because your issues.txt calls out a real-world need:
         # substitutes may not parse-match cleanly; API specs are required. (future)
         if not npr.mfgpn:
             return None

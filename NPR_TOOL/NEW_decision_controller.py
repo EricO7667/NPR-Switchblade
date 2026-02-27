@@ -155,7 +155,7 @@ class DecisionController:
         self.workspace_id: Optional[str] = None
 
         # Map BOM uid -> bom_row_id (built during load_npr / load_bom)
-        # If you haven't wired Step B yet, this stays empty and we just persist nodes w/o bom_row_id.
+
         self._bom_row_by_uid: Dict[str, str] = {}
 
 
@@ -518,7 +518,6 @@ class DecisionController:
                 by_cpn[cpn_key] = dict(r)
 
         # DEBUG: show sample ERP rows that are not found in the currently loaded master CPN set.
-        # This is okay in your workflow, but we still log a sample for visibility.
         master_cpns = {str((r or {}).get("cpn", "")).strip() for r in (self._pending_inventory_company_rows or []) if str((r or {}).get("cpn", "")).strip()}
         erp_only = []
         for cpn, qty in stock_totals.items():
@@ -898,7 +897,6 @@ class DecisionController:
             if needs_new_cpn and not cpn:
                 base_type = "NEW"
 
-            # status mapping (since bom_line_state doesn't store your old UI status field)
             if needs_new_cpn:
                 status = DecisionStatus.NEEDS_ALTERNATE
             elif cpn:
@@ -1011,7 +1009,6 @@ class DecisionController:
         existing_nodes = list(self.nodes or [])
         existing_by_key = {self._node_key(n): n for n in existing_nodes}
     
-        # Generate fresh suggestion nodes using your existing pipeline
         fresh_nodes = self._compute_fresh_nodes_via_run_matching()
     
         # Merge fresh suggestions into existing decisions
@@ -1048,7 +1045,7 @@ class DecisionController:
     
     @staticmethod
     def _node_key(node) -> str:
-        # Your DecisionNode has bom_uid (ROW-#). That’s the best stable identity.
+        # DecisionNode has bom_uid (ROW-#). 
         k = (getattr(node, "bom_uid", "") or "").strip()
         if k:
             return k
@@ -1678,7 +1675,7 @@ class DecisionController:
                     cands = safe_get(match, "candidates", "candidate_parts", default=None) or []
 
                     # Ensure winner is present in candidates (training needs it)
-                    # (Your merge usually does this, but this guarantees it.)
+                    
                     if winner_inv is not None:
                         found = False
                         for c in cands:
@@ -1720,10 +1717,9 @@ class DecisionController:
                         "winner": _inv_to_payload_dict(winner_inv, is_winner=True),
                         "winner_rank": winner_rank,
 
-                        # THIS is the payload candidates you’re asking about
+                    
                         "candidates": cand_payloads,
 
-                        # audit/debug (keep it for now; you can drop later for smaller JSONL)
                         "explain": exp,
                     }
 
@@ -1852,8 +1848,6 @@ class DecisionController:
         # 2) NEW: use parsed type → prefix mapping
         ptype = ""
         # Try to infer from the parsed NPRPart via the node’s description (or store parsed on node later)
-        # If you have the NPRPart available during node creation, best: store node.parsed_type directly.
-        # For now, we can recover from npr_list by bom_uid if needed; simplest v1: set it during _pair_to_node.
         ptype = getattr(node, "parsed_type", "") or "OTHER"
 
         prefix = ""
@@ -2858,7 +2852,7 @@ class DecisionController:
 
 
         def is_full_match_anchor(alt_obj) -> bool:
-            # Best-effort heuristics (same as your original intent)
+           
             rel = (getattr(alt_obj, "relationship", "") or "").strip().lower()
             conf = float(getattr(alt_obj, "confidence", 0.0) or 0.0)
             return (rel == "exact") or (conf >= 0.999)
@@ -2908,7 +2902,6 @@ class DecisionController:
 
             # -------------------------
             # Compute "non-primary selected alternates"
-            # (what you mean by "has alternates selected for it")
             # -------------------------
             non_primary_selected = []
             for alt in node.selected_alternates():
