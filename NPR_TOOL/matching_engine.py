@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+
+
 from typing import Any, Dict, List, Optional
 import json
 import hashlib
@@ -13,6 +15,8 @@ import tkinter
 from rapidfuzz import fuzz
 import re
 import os
+import atexit
+import signal
 import threading
 from dataclasses import dataclass
 from collections import defaultdict
@@ -64,10 +68,42 @@ ENG_W_RERANK = 0.70             # how much reranker dominates final score (0..1)
 ENG_SPLADE_MAX_LEN = 128
 ENG_SPLADE_TOP_TERMS = 256
 ENG_SPARSE_CACHE_ENABLE = 1     # cache doc sparse vectors to disk
-ENG_SPARSE_CACHE_BUILD_INV_INDEX = 1  # build inverted index for full sparse retrieval
+ENG_SPARSE_CACHE_BUILD_INV_INDEX = 0 # build inverted index for full sparse retrieval
 
 # Fuzzy fallback
 ENG_FUZZY_TOPK = 250            # how many best fuzzy candidates to keep
+
+# =====================================================
+# Family Filtering (seed generation) flags
+# =====================================================
+FAM_DEBUG = 1
+FAM_EXPORT = 1
+FAM_EXPORT_MAX_PER_METHOD = 25   # how many sample matches to write per method in detail logs
+FAM_EXPORT_MAX_FINAL = 200       # how many final deduped seeds to keep/export
+FAM_PARALLEL = 1                # run family filters concurrently (threads)
+
+# Method toggles
+FAM_USE_PROGRESSIVE_PREFIX = 1
+FAM_USE_ANCHORED_PREFIX_SUFFIX = 1
+FAM_USE_TOKEN_OVERLAP = 1
+FAM_USE_EDIT_DISTANCE = 1
+FAM_USE_NGRAM_JACCARD = 1
+
+# Progressive prefix parameters
+FAM_MIN_PREFIX_LEN = 6
+FAM_PREFIX_HITS_CAP = 250
+
+# Anchored parameters
+FAM_ANCHOR_PREFIX_LEN = 5
+FAM_ANCHOR_SUFFIX_LEN = 4
+
+# Edit-distance parameters
+FAM_MAX_EDIT_DIST = 2
+FAM_MAX_EDIT_RATIO = 0.15  # dist/len cap; set 0 to disable
+
+# N-gram parameters
+FAM_NGRAM_N = 3
+FAM_NGRAM_MIN_SIM = 0.70
 
 
 # =====================================================
@@ -76,6 +112,16 @@ ENG_FUZZY_TOPK = 250            # how many best fuzzy candidates to keep
 ENG_TRACE_ENABLE = 0
 ENG_TRACE_PATH = "eng_trace.jsonl"   # relative to cache_dir
 ENG_TRACE_TOPN = 250                 # how many candidates to store per stage (save space or look and gander at everything set to size of ENG_TOPK_PRIMARY)
+
+
+
+# -----------------------------
+# Export / shutdown behavior
+# -----------------------------
+BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+EXPORT_FLUSH_EVERY_N = 10  # write reports every N parts (0 disables periodic flush)
+EXPORT_FLUSH_MIN_SECONDS = 0.5  # also flush if this many seconds since last flush
+
 
 # ---------------------------------------------------------
 # Helpers for the MATCHING ENIGINE: Prefix Extractor
@@ -186,6 +232,16 @@ class MatchingEngine:
         self.cache_dir = Path(cache_dir or ".npr_semantic_cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+        # Precompute inventory MPN fields for fast family filtering
+        # Raw vendoritem strings may be messy; we keep both raw and normalized forms.
+        self._inv_vendor_raw: List[str] = [
+            (getattr(inv, "vendoritem", None) or "").strip() for inv in self.inventory
+        ]
+        self._inv_vendor_norm: List[str] = []  # filled after _norm_mpn is available
+        # Family filter run logs (per NPR line)
+        self._family_filter_logs: List[Dict[str, Any]] = []
+        self._family_filter_detail: List[Dict[str, Any]] = []
+
         #self.progress_cb = progress_cb  
 
         if config:
@@ -243,11 +299,24 @@ class MatchingEngine:
 
         # Exact Tier 1 export audit rows
         self._exact_mfgpn_export_rows: List[Dict[str, Any]] = []
+        # periodic export flush state
+        self._export_flush_count = 0
+        self._export_last_flush_ts = 0.0
+        self._family_exports_dirty = False
+        self._last_family_export_len = 0
+
+        # Thread tracking + shutdown handlers (ensures exports flush on hard exits)
+        self._threads: List[threading.Thread] = []
+        try:
+            self._install_shutdown_handlers()
+        except Exception:
+            pass
 
     #===================================================
     # HELPERS
     #===================================================
     def _trace_path(self):
+        # keep trace next to your caches
         return (self.cache_dir / ENG_TRACE_PATH)
 
     def _trace_write(self, rec: dict) -> None:
@@ -271,6 +340,7 @@ class MatchingEngine:
 
 
     def trace_reset(self) -> None:
+        """Call this before a run if you want a clean file."""
         try:
             p = self._trace_path()
             if p.exists():
@@ -280,6 +350,104 @@ class MatchingEngine:
 
     def reset_match_exports(self) -> None:
         self._exact_mfgpn_export_rows = []
+        # Family filter run logs (per NPR line)
+        self._family_filter_logs = []
+        self._family_filter_detail = []
+
+    def _maybe_flush_exports(self, *, force: bool = False) -> None:
+        """Periodically flush exports to disk so hard-kills still leave artifacts."""
+        try:
+            import time
+            now = time.time()
+            self._export_flush_count = int(getattr(self, "_export_flush_count", 0) or 0)
+            self._export_last_flush_ts = float(getattr(self, "_export_last_flush_ts", 0.0) or 0.0)
+
+            if not force:
+                n = int(globals().get("EXPORT_FLUSH_EVERY_N", EXPORT_FLUSH_EVERY_N) or 0)
+                min_s = float(globals().get("EXPORT_FLUSH_MIN_SECONDS", EXPORT_FLUSH_MIN_SECONDS) or 0.0)
+                due_n = (n > 0 and self._export_flush_count > 0 and (self._export_flush_count % n) == 0)
+                due_t = (min_s > 0 and (now - self._export_last_flush_ts) >= min_s)
+                if not (due_n or due_t):
+                    return
+
+            # Avoid rewriting family exports if nothing new has been logged
+            fam_len = len(getattr(self, '_family_filter_logs', []) or [])
+            last_len = int(getattr(self, '_last_family_export_len', 0) or 0)
+            fam_dirty = bool(getattr(self, '_family_exports_dirty', False))
+            if not force and (not fam_dirty) and fam_len <= last_len:
+                # Still allow exact export periodic, but skip family export rewrite when unchanged
+                pass
+
+            # Exact tier export
+            try:
+                p = self.export_exact_mfgpn_matches_txt()
+                print(f"[EXACT] export OK: {p}")
+            except Exception as e:
+                print(f"[EXACT] export failed: {e}")
+
+            # Family filter export
+            try:
+                csv_p, txt_p = self.export_family_filter_reports()
+                print(f"[FAM] export OK: {csv_p}")
+                print(f"[FAM] export OK: {txt_p}")
+                self._last_family_export_len = len(getattr(self, '_family_filter_logs', []) or [])
+                self._family_exports_dirty = False
+            except Exception as e:
+                print(f"[FAM] export failed: {e}")
+
+            self._export_last_flush_ts = now
+        except Exception as e:
+            print(f"[EXPORT] flush failed: {e}")
+
+
+    def begin_match_run(self) -> None:
+        """Call once before a multi-part match run."""
+        self.reset_match_exports()
+
+    def end_match_run(self, *, export_family: Optional[bool] = None) -> None:
+        """Call once after a multi-part match run."""
+        do_export = bool(int(globals().get("FAM_EXPORT", 1))) if export_family is None else bool(export_family)
+
+        # Export Tier 1 exact MFGPN audit (kept in cache_dir)
+        try:
+            self.export_exact_mfgpn_matches_txt()
+        except Exception as e:
+            print(f"[EXACT] export failed: {e}")
+            raise
+
+        # Export family filter reports (written next to this python file)
+        if do_export:
+            try:
+                csv_path, txt_path = self.export_family_filter_reports()
+                print(f"[FAM] export OK: {csv_path}")
+                print(f"[FAM] export OK: {txt_path}")
+            except Exception as e:
+                print(f"[FAM] export failed: {e}")
+                raise
+
+    def match_list(self, npr_list: List[NPRPart], *, progress_cb=None) -> List[MatchResult]:
+        """Synchronous bulk match (your controller can call this).
+
+        - Resets per-run logs/exports
+        - Runs match_single_part on each NPRPart
+        - Exports reports at the end (unless stopped)
+        """
+        self.begin_match_run()
+        out: List[MatchResult] = []
+        total = len(npr_list or [])
+        for i, npr in enumerate(npr_list or [], start=1):
+            if self._should_stop():
+                break
+            if progress_cb:
+                try:
+                    progress_cb(i, total, npr)
+                except Exception:
+                    pass
+            out.append(self.match_single_part(npr))
+        # Only export if we weren't cancelled
+        if not self._should_stop():
+            self.end_match_run()
+        return out
 
     def export_exact_mfgpn_matches_txt(self, filepath: Optional[str] = None) -> str:
         """
@@ -288,7 +456,7 @@ class MatchingEngine:
         Returns the final file path written.
         """
         if filepath is None:
-            filepath = str(self.cache_dir / "exact_mfgpn_matches.txt")
+            filepath = str(BASE_DIR / "exact_mfgpn_matches.txt")
 
         p = Path(filepath)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -398,6 +566,137 @@ class MatchingEngine:
         except Exception:
             return None
 
+
+    # -----------------------------
+    # Shutdown / thread lifecycle
+    # -----------------------------
+    _shutdown_handlers_installed = False
+
+    def _install_shutdown_handlers(self) -> None:
+        # Install at process level once. Safe to call multiple times.
+        cls = self.__class__
+        if getattr(cls, "_shutdown_handlers_installed", False):
+            return
+        cls._shutdown_handlers_installed = True
+
+        def _cleanup():
+            try:
+                self._maybe_flush_exports(force=True)
+            except Exception:
+                pass
+            try:
+                self.shutdown(timeout_s=1.5)
+            except Exception:
+                pass
+
+        atexit.register(_cleanup)
+
+        # Best-effort signal handling (may be limited on Windows / some environments)
+        try:
+            def _handle(sig, frame):
+                try:
+                    self._maybe_flush_exports(force=True)
+                except Exception:
+                    pass
+                try:
+                    self.shutdown(timeout_s=1.5)
+                finally:
+                    raise SystemExit(0)
+
+            for s in ("SIGINT", "SIGTERM"):
+                if hasattr(signal, s):
+                    signal.signal(getattr(signal, s), _handle)
+        except Exception:
+            pass
+
+    def shutdown(self, timeout_s: float = 1.5) -> None:
+        """Signal background workers to stop and join briefly.
+
+        Notes:
+        - Python cannot force-kill threads safely.
+        - This is cooperative: workers must check self.stop_event periodically.
+        - Threads are started as daemon threads so they will not keep the process alive.
+        """
+        try:
+            if self.stop_event:
+                self.stop_event.set()
+        except Exception:
+            pass
+
+        # Join threads we started (best-effort, bounded)
+        deadline = time.time() + float(timeout_s)
+        for t in list(getattr(self, "_threads", []) or []):
+            if not t:
+                continue
+            if not t.is_alive():
+                continue
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                t.join(timeout=max(0.0, remaining))
+            except Exception:
+                pass
+
+    def _start_thread(self, target, *, name: str = "MatchingEngineWorker") -> threading.Thread:
+        t = threading.Thread(target=target, name=name, daemon=True)
+        try:
+            self._threads.append(t)
+        except Exception:
+            pass
+        t.start()
+        return t
+    # -----------------------------
+    # Run-boundary free exports
+    # -----------------------------
+    def _ensure_run_started(self) -> None:
+        """Ensure per-run export buffers are initialized without requiring controller changes."""
+        if not getattr(self, "_run_started", False):
+            try:
+                self.reset_match_exports()
+            except Exception:
+                pass
+            # Family filter reports also use these buffers
+            try:
+                self._family_filter_logs = []
+                self._family_filter_detail = []
+            except Exception:
+                pass
+            self._run_started = True
+            self._exports_written = False
+
+    def _export_on_exit(self) -> None:
+        """Best-effort export at process exit (no controller integration required)."""
+        if getattr(self, "_exports_written", False):
+            return
+        # Only export if we actually ran matches / collected anything
+        ran = bool(getattr(self, "_run_started", False))
+        has_fam = bool(getattr(self, "_family_filter_logs", []) or getattr(self, "_family_filter_detail", []))
+        has_exact = bool(getattr(self, "_exact_mfgpn_export_rows", []))
+        if not ran or (not has_fam and not has_exact):
+            return
+
+        try:
+            # Exact tier export
+            if has_exact and bool(int(globals().get("EXACT_EXPORT", 1))):
+                p = self.export_exact_mfgpn_matches_txt()
+                print(f"[EXACT] export OK: {p}")
+        except Exception as e:
+            print(f"[EXACT] export failed: {e}")
+
+        try:
+            # Family filter export
+            if has_fam and bool(int(globals().get("FAM_EXPORT", 1))):
+                csv_path, txt_path = self.export_family_filter_reports()
+                print(f"[FAM] export OK: {csv_path}")
+                print(f"[FAM] export OK: {txt_path}")
+        except Exception as e:
+            print(f"[FAM] export failed: {e}")
+
+        self._exports_written = True
+
+
+
     def _should_stop(self) -> bool:
         try:
             return bool(self.stop_event and self.stop_event.is_set())
@@ -475,7 +774,7 @@ class MatchingEngine:
                 print(f"[SPLADE] failed to load doc cache: {e}")
             return False
 
-    # Splade cahching works, but an issue with it is that unlike the embeded, any change to the input BOM changes cuases a complete reworking of th esplade model, meaning have to wait or all 5000+ splade thingies to do things
+    # Splade cahching works, but an issue with it is that unlike the embeded, any change to the input BOM changes cuases a complete reworking of th esplade model, meaning we have to wait or all 5000+ splade thingies to do things
     def _save_splade_doc_cache(self) -> None:
         if not ENG_SPARSE_CACHE_ENABLE:
             return
@@ -758,7 +1057,7 @@ class MatchingEngine:
     # =====================================================
 
     #TODO: concern needed to address for scalability
-    # fix ptype hard gating. a big issue is that way match part types is a limitiing factor, as if th epart type is incorrect downstream issues will occure in the matching. 
+    # fix ptype hard gating. a big issue is that way we match part types is a limitiing factor, as if th epart type is incorrect downstream issues will occure in the matching. 
     # this needs ot be reworded and better logic reguarding searchign thogh the CNS needs to be resovled beofre hand before applying matching p types. 
 
     # ptype matching may be hindering the process here. cardcodign any values like res cap ind or diode is the wrong implementation and all of this should be removed.
@@ -766,7 +1065,7 @@ class MatchingEngine:
 
     # there are truths and non truths in all of this:
     # 1: The CNS provides to us a number catergoization of types 1-99. Each invnetory item will need to explicitly be matched with its ptype (easy to do, the company part number prefix TELLS us what part it belongs under)
-    # 2: in the matching logic, when given a part number from a BOM, need to attach a ptype match to each part SOMEHOW. then when comparing against the inventory, need to make sure that ptypes match (lowering the pool of data it needs to sluth through reducing error margins)
+    # 2: in the matching logic, when given a part number from a BOM, we need to attach a ptype match to each part SOMEHOW. then when comparing against the inventory, we need to make sure that ptypes match (lowering the pool of data it needs to sluth through reducing error margins)
 
     def _ptype_signal(self, obj: Any) -> Dict[str, Any]:
         """
@@ -778,11 +1077,13 @@ class MatchingEngine:
           }
 
         Notes:
-        - treat OTHER as "unknown-ish": do NOT hard-gate on it.
+        - We treat OTHER as "unknown-ish": do NOT hard-gate on it.
         - If CNS (or other authoritative upstream) provides a type, it wins.
         """
         p = self._safe_get_parsed(obj)
 
+        # 1) Authoritative hint (optional): if you ever attach CNS-derived type to parsed
+        #    e.g. p["cns_type"] = "CAP", treat as highest confidence.
         raw = (p.get("cns_type") or p.get("type") or p.get("component") or p.get("kind") or "")
         raw_u = str(raw).strip().upper()
 
@@ -901,7 +1202,7 @@ class MatchingEngine:
         n_type = self._ptype(npr_p)  # bucket only: RESISTOR/CAPACITOR/INDUCTOR/DIODE/OTHER
         
 
-        # If don't know the family, don't gate at all.
+        # If we don't know the family, don't gate at all.
         if n_type == "OTHER":
             return list(candidates or [])
 
@@ -966,7 +1267,7 @@ class MatchingEngine:
                 import traceback
                 traceback.print_exc()
                 print("[MatchingEngine] Async embedding initialization failed:", e)
-        threading.Thread(target=_run, daemon=True).start()
+        self._start_thread(_run, name="EmbedInit")
 
     def _init_embeddings_cache(self, *, force: bool = False):
         """
@@ -1143,9 +1444,10 @@ class MatchingEngine:
         """
         Normalize manufacturer part numbers for deterministic matching.
 
-        Current intent:
-        - uppercase
+        Intent:
+        - uppercase + trim
         - remove whitespace
+        - remove parenthesis groups (packaging / compliance suffixes like (LF)(SN))
         - remove common visual separators that should not change identity
           (dash, underscore, slash, backslash, period)
         """
@@ -1153,10 +1455,17 @@ class MatchingEngine:
         if not s:
             return ""
 
+        # Remove all whitespace
         s = re.sub(r"\s+", "", s)
-        s = re.sub(r"[-_/\\.]", "", s)
-        return s
 
+        # Drop parenthetical suffix groups like (LF)(SN)
+        # (Treat as non-identity metadata for matching)
+        s = re.sub(r"\([^)]*\)", "", s)
+
+        # Remove common separators
+        s = re.sub(r"[-_/\\.]", "", s)
+
+        return s
     def _inv_desc(self, inv: Any) -> str:
         return (
             getattr(inv, "desc", None)
@@ -1180,24 +1489,336 @@ class MatchingEngine:
     # Match tiers - litterally the heart of this all
     # =====================================================
 
+    # ---------------------------------------------------------
+    # Family filtering (seed candidate generation)
+    # ---------------------------------------------------------
+    def _ensure_inv_vendor_norm(self) -> None:
+        if self._inv_vendor_norm and len(self._inv_vendor_norm) == len(self._inv_vendor_raw):
+            return
+        self._inv_vendor_norm = [self._norm_mpn(s) for s in self._inv_vendor_raw]
+
+    def _fam_prefilter_indices(self, mpn_norm: str) -> List[int]:
+        """Cheap prefilter to avoid scanning all inventory for expensive similarity methods."""
+        self._ensure_inv_vendor_norm()
+        if not mpn_norm:
+            return []
+        n = len(mpn_norm)
+        head = mpn_norm[:2]
+        # Length window and head bucket
+        out = []
+        for i, v in enumerate(self._inv_vendor_norm):
+            if not v:
+                continue
+            if v[:2] != head:
+                continue
+            lv = len(v)
+            if lv < n - 3 or lv > n + 3:
+                continue
+            out.append(i)
+        return out
+
+    def _fam_method_progressive_prefix(self, mpn_norm: str) -> Dict[int, float]:
+        self._ensure_inv_vendor_norm()
+        if not mpn_norm:
+            return {}
+        L = len(mpn_norm)
+        minL = max(int(globals().get("FAM_MIN_PREFIX_LEN", 6)), 1)
+        cap = int(globals().get("FAM_PREFIX_HITS_CAP", 250))
+        # Try longest to shortest until we get a bounded hit set
+        for k in range(L, minL - 1, -1):
+            prefix = mpn_norm[:k]
+            hits = [i for i, v in enumerate(self._inv_vendor_norm) if v.startswith(prefix)]
+            if 0 < len(hits) <= cap:
+                # Score by prefix coverage
+                score = k / max(L, 1)
+                return {i: score for i in hits}
+        return {}
+
+    def _fam_method_anchor(self, mpn_norm: str) -> Dict[int, float]:
+        self._ensure_inv_vendor_norm()
+        if not mpn_norm:
+            return {}
+        p = int(globals().get("FAM_ANCHOR_PREFIX_LEN", 5))
+        s = int(globals().get("FAM_ANCHOR_SUFFIX_LEN", 4))
+        if len(mpn_norm) < p + s:
+            return {}
+        pre = mpn_norm[:p]
+        suf = mpn_norm[-s:]
+        hits = {}
+        for i, v in enumerate(self._inv_vendor_norm):
+            if not v or len(v) < p + s:
+                continue
+            if v.startswith(pre) and v.endswith(suf):
+                hits[i] = 0.85
+        return hits
+
+    def _fam_method_token_overlap(self, mpn_raw: str) -> Dict[int, float]:
+        # Tokenize raw MPN by common delimiters; compare overlap in token space.
+        if not mpn_raw:
+            return {}
+        toks = [t for t in re.split(r"[-_/\\.\s]+", mpn_raw.strip().upper()) if t]
+        if not toks:
+            return {}
+        first = toks[0]
+        set_toks = set(toks)
+        hits = {}
+        for i, raw in enumerate(self._inv_vendor_raw):
+            if not raw:
+                continue
+            inv_toks = [t for t in re.split(r"[-_/\\.\s]+", raw.strip().upper()) if t]
+            if not inv_toks:
+                continue
+            if inv_toks[0] != first:
+                continue
+            inter = len(set_toks.intersection(inv_toks))
+            if inter >= 2:
+                # Score by overlap fraction
+                score = inter / max(len(set_toks), 1)
+                hits[i] = 0.70 + 0.20 * min(score, 1.0)
+        return hits
+
+    def _fam_method_edit_distance(self, mpn_norm: str) -> Dict[int, float]:
+        self._ensure_inv_vendor_norm()
+        if not mpn_norm:
+            return {}
+        try:
+            from rapidfuzz.distance import Levenshtein
+        except Exception:
+            return {}
+        maxd = int(globals().get("FAM_MAX_EDIT_DIST", 2))
+        max_ratio = float(globals().get("FAM_MAX_EDIT_RATIO", 0.15))
+        cand_idx = self._fam_prefilter_indices(mpn_norm)
+        hits = {}
+        n = len(mpn_norm)
+        for i in cand_idx:
+            v = self._inv_vendor_norm[i]
+            if not v:
+                continue
+            d = Levenshtein.distance(mpn_norm, v)
+            if d <= maxd:
+                if max_ratio and n:
+                    if (d / n) > max_ratio:
+                        continue
+                # Higher score for smaller distance
+                hits[i] = 0.95 - 0.10 * d
+        return hits
+
+    def _fam_method_ngram_jaccard(self, mpn_norm: str) -> Dict[int, float]:
+        self._ensure_inv_vendor_norm()
+        if not mpn_norm:
+            return {}
+        n = int(globals().get("FAM_NGRAM_N", 3))
+        min_sim = float(globals().get("FAM_NGRAM_MIN_SIM", 0.70))
+        if len(mpn_norm) < n + 2:
+            return {}
+        def grams(s: str) -> set:
+            return {s[i:i+n] for i in range(0, len(s) - n + 1)}
+        g0 = grams(mpn_norm)
+        cand_idx = self._fam_prefilter_indices(mpn_norm)
+        hits = {}
+        for i in cand_idx:
+            v = self._inv_vendor_norm[i]
+            if not v or len(v) < n + 2:
+                continue
+            g1 = grams(v)
+            inter = len(g0.intersection(g1))
+            if inter == 0:
+                continue
+            union = len(g0) + len(g1) - inter
+            sim = inter / union if union else 0.0
+            if sim >= min_sim:
+                hits[i] = sim  # already 0..1
+        return hits
+
+    def family_filter_seed(self, npr: NPRPart) -> Tuple[List[Any], Dict[str, Any]]:
+        """Run all enabled family filters, union + dedupe, cap, and return seed candidates."""
+        mpn_raw = (getattr(npr, "mfgpn", None) or "").strip()
+        mpn_norm = self._norm_mpn(mpn_raw)
+
+        enabled = {
+            "progressive_prefix": bool(int(globals().get("FAM_USE_PROGRESSIVE_PREFIX", 1))),
+            "anchor": bool(int(globals().get("FAM_USE_ANCHORED_PREFIX_SUFFIX", 1))),
+            "token_overlap": bool(int(globals().get("FAM_USE_TOKEN_OVERLAP", 1))),
+            "edit_distance": bool(int(globals().get("FAM_USE_EDIT_DISTANCE", 1))),
+            "ngram_jaccard": bool(int(globals().get("FAM_USE_NGRAM_JACCARD", 1))),
+        }
+
+        methods = []
+        if enabled["progressive_prefix"]:
+            methods.append(("progressive_prefix", lambda: self._fam_method_progressive_prefix(mpn_norm)))
+        if enabled["anchor"]:
+            methods.append(("anchor", lambda: self._fam_method_anchor(mpn_norm)))
+        if enabled["token_overlap"]:
+            methods.append(("token_overlap", lambda: self._fam_method_token_overlap(mpn_raw)))
+        if enabled["edit_distance"]:
+            methods.append(("edit_distance", lambda: self._fam_method_edit_distance(mpn_norm)))
+        if enabled["ngram_jaccard"]:
+            methods.append(("ngram_jaccard", lambda: self._fam_method_ngram_jaccard(mpn_norm)))
+
+        timings = {}
+        results = {}
+        detail = {}
+
+        def run_one(name, fn):
+            t0 = time.perf_counter()
+            out = fn() or {}
+            dt = (time.perf_counter() - t0) * 1000.0
+            return name, out, dt
+
+        if bool(int(globals().get("FAM_PARALLEL", 1))) and len(methods) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=len(methods)) as ex:
+                futs = [ex.submit(run_one, name, fn) for name, fn in methods]
+                for fut in as_completed(futs):
+                    name, out, dt = fut.result()
+                    timings[name] = dt
+                    detail[name] = out
+        else:
+            for name, fn in methods:
+                name, out, dt = run_one(name, fn)
+                timings[name] = dt
+                detail[name] = out
+
+        # Union + dedupe with score aggregation (max score wins)
+        agg: Dict[int, float] = {}
+        for name, out in detail.items():
+            for idx, sc in out.items():
+                if idx not in agg or sc > agg[idx]:
+                    agg[idx] = sc
+
+        # Sort by score desc, then by stock desc as tiebreak
+        max_final = int(globals().get("FAM_EXPORT_MAX_FINAL", 200))
+        ranked = sorted(
+            agg.items(),
+            key=lambda kv: (kv[1], getattr(self.inventory[kv[0]], "stock", 0) or 0),
+            reverse=True
+        )
+        ranked = ranked[:max_final]
+
+        seed_idx = [i for i, _ in ranked]
+        seed_parts = [self.inventory[i] for i in seed_idx]
+
+        # Build report + samples
+        max_per_method = int(globals().get("FAM_EXPORT_MAX_PER_METHOD", 25))
+        for name, out in detail.items():
+            # sample by score
+            samp = sorted(out.items(), key=lambda kv: kv[1], reverse=True)[:max_per_method]
+            samples = []
+            for idx, sc in samp:
+                inv = self.inventory[idx]
+                samples.append({
+                    "score": float(sc),
+                    "itemnum": self._inv_item(inv),
+                    "vendoritem": (getattr(inv, "vendoritem", None) or "").strip(),
+                    "desc": self._inv_desc(inv),
+                })
+            results[name] = {
+                "time_ms": float(timings.get(name, 0.0)),
+                "count": int(len(out)),
+                "samples": samples,
+            }
+
+        report = {
+            "npr_partnum": (getattr(npr, "partnum", None) or "").strip(),
+            "npr_mfgpn_raw": mpn_raw,
+            "npr_mfgpn_norm": mpn_norm,
+            "enabled": enabled,
+            "methods": results,
+            "final_count": len(seed_parts),
+        }
+
+        # terminal output
+        if bool(int(globals().get("FAM_DEBUG", 1))):
+            print(f"[FAM] part={report['npr_partnum']} mpn={mpn_raw} (norm={mpn_norm})")
+            for name in results:
+                r = results[name]
+                print(f"  - {name}: {r['count']} hits in {r['time_ms']:.2f} ms")
+            print(f"  => final deduped: {report['final_count']}\n")
+
+        # store logs for export
+        self._family_filter_logs.append({
+            "npr_partnum": report["npr_partnum"],
+            "npr_mfgpn_raw": mpn_raw,
+            "npr_mfgpn_norm": mpn_norm,
+            "final_count": report["final_count"],
+            **{f"{name}_count": results[name]["count"] for name in results},
+            **{f"{name}_ms": results[name]["time_ms"] for name in results},
+        })
+        self._family_filter_detail.append(report)
+        self._family_exports_dirty = True
+
+        return seed_parts, report
+
+    def export_family_filter_reports(self, basepath: Optional[str] = None) -> Tuple[str, str]:
+        """Export family filter logs to CSV (summary) and TXT (detail). Returns (csv_path, txt_path)."""
+        if basepath is None:
+            # Write to current working directory by default (predictable for CLI/exe runs)
+            basepath = str(Path.cwd() / "family_filter_report")
+
+        csv_path = str(Path(basepath).with_suffix(".csv"))
+        txt_path = str(Path(basepath).with_suffix(".txt"))
+
+        # Ensure output directory exists
+        Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # CSV summary
+        rows = list(self._family_filter_logs or [])
+        if rows:
+            # stable columns
+            cols = sorted({k for r in rows for k in r.keys()})
+            with open(csv_path, "w", encoding="utf-8") as f:
+                f.write(",".join(cols) + "\n")
+                for r in rows:
+                    vals = []
+                    for c in cols:
+                        v = r.get(c, "")
+                        s = str(v).replace("\n", " ").replace("\r", " ")
+                        if "," in s or '"' in s:
+                            s = '"' + s.replace('"', '""') + '"'
+                        vals.append(s)
+                    f.write(",".join(vals) + "\n")
+        else:
+            with open(csv_path, "w", encoding="utf-8") as f:
+                f.write("")
+
+        # TXT detail
+        detail = list(self._family_filter_detail or [])
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("FAMILY FILTER REPORT\n")
+            f.write("=" * 80 + "\n\n")
+            for rep in detail:
+                f.write(f"NPR Part Number : {rep.get('npr_partnum','')}\n")
+                f.write(f"NPR MFGPN Raw   : {rep.get('npr_mfgpn_raw','')}\n")
+                f.write(f"NPR MFGPN Norm  : {rep.get('npr_mfgpn_norm','')}\n")
+                f.write("\nMethods:\n")
+                for name, mr in rep.get("methods", {}).items():
+                    f.write(f"  {name}: {mr.get('count',0)} hits in {mr.get('time_ms',0):.2f} ms\n")
+                    for s in (mr.get("samples", []) or []):
+                        f.write(f"    - score={s.get('score',0):.3f} item={s.get('itemnum','')} mpn={s.get('vendoritem','')}\n")
+                    f.write("\n")
+                f.write(f"Final deduped count: {rep.get('final_count',0)}\n")
+                f.write("-" * 80 + "\n\n")
+
+        return csv_path, txt_path
+
     def match_single_part(self, npr: NPRPart) -> MatchResult:
+        self._ensure_run_started()
+        # Periodic export flushing so abrupt termination still leaves artifacts
+        try:
+            self._export_flush_count = int(getattr(self, "_export_flush_count", 0) or 0) + 1
+            self._maybe_flush_exports(force=False)
+        except Exception:
+            pass
         # Tier 1 — Exact MFG PN
         if npr.mfgpn:
             match = self._match_by_mfgpn(npr)
             if match:
                 return match
-
-        # Tier 1.5 — Family Prefix
-        # Tier 1.5 — Family Prefix (DO NOT early-return; use as seed only)
-        prefix_hits = None
+        # Tier 1.5 — Family Filtering (seed only; no early-return)
+        seed_candidates = None
         if npr.mfgpn:
-            prefix = mpn_prefix(npr.mfgpn)
-            if prefix:
-                prefix_u = prefix.strip().upper()
-                prefix_hits = [
-                    inv for inv in self.inventory
-                    if inv.vendoritem and inv.vendoritem.strip().upper().startswith(prefix_u)
-                ]
+            seed_candidates, _fam_report = self.family_filter_seed(npr)
+
         # Tier 2 — Item Number
         if npr.partnum:
             match = self._match_by_itemnum(npr)
@@ -1210,7 +1831,7 @@ class MatchingEngine:
             return match
 
         # Tier 3 — Semantic (replaces engineering)
-        match = self._engineering_match(npr, seed_candidates=prefix_hits)
+        match = self._engineering_match(npr, seed_candidates=seed_candidates)
         if match:
             return match
 
@@ -1329,7 +1950,8 @@ class MatchingEngine:
             return None
     
         # conflict handling: same MFGPN maps to multiple base parts.
-        # still pick a deterministic "best" base (highest stock) to avoid inflating UI cards,
+        # We still pick a deterministic "best" base (highest stock) to avoid inflating UI cards,
+        # but we preserve the conflict list in explain so you can audit it.
         if key in self._sub_mpn_conflicts:
             inv = self._sub_mpn_index.get(key)
             return MatchResult(
@@ -1591,7 +2213,7 @@ class MatchingEngine:
 
         # ---- TRACE FIX #2: store secondary under explicit stage name ("dense" or "sparse") ----
         # Important: primary already wrote one of dense/sparse/fuzzy; secondary writes the OTHER signal.
-        # If it happens to match the same name (shouldn't in normal dense<->sparse),suffix it to avoid overwriting.
+        # If it happens to match the same name (shouldn't in normal dense<->sparse), we suffix it to avoid overwriting.
         if secondary_label in ("dense", "sparse"):
             stage_secondary_name = secondary_label
             if stage_secondary_name in trace["stages"]:
@@ -1643,6 +2265,7 @@ class MatchingEngine:
         for inv, seed in zip(candidates, hybrid):
             inv._pc_seed = float(seed)
 
+        # candidates_idx aligns with hybrid before you sort candidates
         topn = min(int(ENG_TRACE_TOPN), len(candidates_idx))
         trace["stages"]["hybrid_seed"] = {
             "count": len(candidates_idx),
@@ -1787,6 +2410,7 @@ class MatchingEngine:
     # Tier 4 — API Match (future)
     # =====================================================
     def _match_by_api_data(self, npr: NPRPart) -> Optional[MatchResult]:
+        # This tier exists because your issues.txt calls out a real-world need:
         # substitutes may not parse-match cleanly; API specs are required. (future)
         if not npr.mfgpn:
             return None
@@ -1821,6 +2445,20 @@ class MatchingEngine:
     def match_async(self, npr_list: List[NPRPart], callback):
         """Runs full match list in a background thread to keep UI responsive."""
         def task():
+            # reset per-run exports/logs
+            self.reset_match_exports()
+            self._family_filter_logs = []
+            self._family_filter_detail = []
             results = [(npr, self.match_single_part(npr)) for npr in npr_list]
+            # export family filter reports for this run
+            if bool(int(globals().get("FAM_EXPORT", 1))):
+                try:
+                    csv_path, txt_path = self.export_family_filter_reports()
+                    print(f"[FAM] export OK: {csv_path}")
+                    print(f"[FAM] export OK: {txt_path}")
+                except Exception as e:
+                    # Never silently fail: print always
+                    print(f"[FAM] export failed: {e}")
+                    raise
             callback(results)
-        threading.Thread(target=task, daemon=True).start()
+        self._start_thread(task, name="MatchAsync")

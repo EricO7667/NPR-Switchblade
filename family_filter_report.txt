@@ -1,0 +1,79 @@
+FAMILY FILTER REPORT
+================================================================================
+
+NPR Part Number : HY-200-004-002
+NPR MFGPN Raw   : CC0402ZRY5V7BB104
+NPR MFGPN Norm  : CC0402ZRY5V7BB104
+
+Methods:
+  ngram_jaccard: 0 hits in 0.63 ms
+
+  token_overlap: 0 hits in 8.01 ms
+
+  progressive_prefix: 4 hits in 20.25 ms
+    - score=0.353 item=21-10067-0272 mpn=CC0402KRX7R9BB272
+    - score=0.353 item=21-10067-0561 mpn=CC0402KRX7R9BB561
+    - score=0.353 item=21-10067-0681 mpn=CC0402KPX7R9BB681
+    - score=0.353 item=21-10094-0563 mpn=CC0402KRX7R6BB563
+
+  edit_distance: 0 hits in 0.63 ms
+
+  anchor: 0 hits in 0.60 ms
+
+Final deduped count: 4
+--------------------------------------------------------------------------------
+
+NPR Part Number : HY-650-089-012
+NPR MFGPN Raw   : 650-089-012
+NPR MFGPN Norm  : 650089012
+
+Methods:
+  ngram_jaccard: 0 hits in 2.53 ms
+
+  edit_distance: 0 hits in 2.88 ms
+
+  token_overlap: 0 hits in 33.61 ms
+
+  progressive_prefix: 0 hits in 7.30 ms
+
+  anchor: 0 hits in 2.23 ms
+
+Final deduped count: 0
+--------------------------------------------------------------------------------
+
+NPR Part Number : HY-850-005-005
+NPR MFGPN Raw   : ERJ-2GEJ224X
+NPR MFGPN Norm  : ERJ2GEJ224X
+
+Methods:
+  edit_distance: 0 hits in 2.75 ms
+
+  anchor: 0 hits in 2.12 ms
+
+  ngram_jaccard: 0 hits in 3.20 ms
+
+  token_overlap: 0 hits in 34.08 ms
+
+  progressive_prefix: 0 hits in 10.98 ms
+
+Final deduped count: 0
+--------------------------------------------------------------------------------
+
+NPR Part Number : MX-102-0213-0
+NPR MFGPN Raw   : 04023C103KAT2A
+NPR MFGPN Norm  : 04023C103KAT2A
+
+Methods:
+  edit_distance: 0 hits in 2.67 ms
+
+  anchor: 0 hits in 2.20 ms
+
+  ngram_jaccard: 0 hits in 2.65 ms
+
+  progressive_prefix: 0 hits in 15.90 ms
+
+  token_overlap: 0 hits in 36.30 ms
+
+Final deduped count: 0
+--------------------------------------------------------------------------------
+

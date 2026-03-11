@@ -67,6 +67,9 @@ class DecisionWorkspaceCTK:
         self.refresh_node_table()
         self._render_empty_state()
 
+        self._suspend_desc_trace = False
+        self.desc_var.trace_add("write", self._on_desc_var_changed)
+
     # ---------------------------------------------------------------------
     # ttk styles (Treeview + Panedwindow)
     # ---------------------------------------------------------------------
@@ -109,6 +112,9 @@ class DecisionWorkspaceCTK:
         except Exception:
             self.node_row_colors = {}
 
+
+
+
     # ---------------------------------------------------------------------
     # Toolbar
     # ---------------------------------------------------------------------
@@ -147,6 +153,20 @@ class DecisionWorkspaceCTK:
         self.status_var = tk.StringVar(value="Ready.")
         status = ctk.CTkLabel(bar, textvariable=self.status_var, text_color=self.COLORS["text_dim"])
         status.pack(side="right", padx=10)
+
+
+    def _on_desc_var_changed(self, *_args):
+        if getattr(self, "_suspend_desc_trace", False):
+            return
+        if not getattr(self, "current_node_id", None):
+            return
+        try:
+            node = self.controller.get_node(self.current_node_id)
+            if bool(getattr(node, "locked", False)):
+                return
+            self.controller.set_node_description(self.current_node_id, self.desc_var.get())
+        except Exception:
+            pass
 
     # ---------------------------------------------------------------------
     # Layout (ttk Panedwindows inside CTk frames)
@@ -251,8 +271,6 @@ class DecisionWorkspaceCTK:
         ctk.CTkLabel(desc_row, text="Description:", text_color="#CBD5E1").pack(side="left", padx=(0, 8))
         self.desc_entry = ctk.CTkEntry(desc_row, width=720, textvariable=self.desc_var)
         self.desc_entry.pack(side="left", padx=(0, 10))
-        self.apply_desc_btn = ctk.CTkButton(desc_row, text="Update Desc", command=self._apply_description, width=140)
-        self.apply_desc_btn.pack(side="left")
 
 
         btn_row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -419,12 +437,56 @@ class DecisionWorkspaceCTK:
         self._render_specs_for_node(node)
 
     def _render_header_state(self, node: DecisionNode):
-        self.h_title.configure(text=f"Company PN: {getattr(node, 'internal_part_number', '') or getattr(node, 'assigned_part_number', '') or '—'}")
+        # Header values are driven ONLY by committed state.
+        # - Clicking a card (pin/view) must never affect header fields.
+        # - If an alternate has been ADDED (selected), show that alternate's CPN + description.
+        # - Otherwise show the BOM line's current values (assigned PN + BOM description).
+    
+        alts = list(getattr(node, "alternates", []) or [])
+        selected_alt = None
+        try:
+            for a in alts:
+                if bool(getattr(a, "selected", False)) and not bool(getattr(a, "rejected", False)):
+                    selected_alt = a
+                    break
+        except Exception:
+            selected_alt = None
+    
+        # Reject-all / all-cards-rejected unlocks manual editing (for PN)
+        try:
+            all_rejected = bool(alts) and all(bool(getattr(a, "rejected", False)) for a in alts)
+        except Exception:
+            all_rejected = False
+    
+        # Committed display values (RESTORED: selected card drives desc_val when selected)
+        if selected_alt is not None:
+            pn_val = (getattr(selected_alt, "internal_part_number", "") or "").strip() or \
+                     (getattr(node, "internal_part_number", "") or "").strip()
+            desc_val = (getattr(selected_alt, "description", "") or "").strip() or \
+                       (getattr(node, "description", "") or "").strip()
+        else:
+            pn_val = (getattr(node, "assigned_part_number", "") or "").strip()
+            desc_val = (getattr(node, "description", "") or "").strip()
+    
+        self.h_title.configure(text=f"Company PN: {pn_val or '—'}")
         self.h_desc.configure(text=f"BOM MPN: {getattr(node, 'bom_mpn', '') or '—'}")
         self.h_meta.configure(text=str(getattr(node.status, "value", node.status)))
-
-        self.suggested_var.set((getattr(node, "suggested_pb", "") or "").strip())
-        self.company_pn_var.set((getattr(node, "assigned_part_number", "") or getattr(node, "internal_part_number", "") or "").strip())
+    
+        # Suggested CNS: prefer current visible PN when present, else suggested_pb
+        _suggest = (getattr(node, "suggested_pb", "") or "").strip()
+        if pn_val:
+            _suggest = pn_val
+        self.suggested_var.set(_suggest)
+    
+        # Populate header edit fields
+        self._suspend_desc_trace = True
+        try:
+            self.company_pn_var.set(pn_val)
+            self.desc_var.set(desc_val)
+        finally:
+            self._suspend_desc_trace = False
+    
+        # BOM section widget
         try:
             self._suspend_bom_section_event = True
             sec = self.controller.get_node_bom_section(node.id)
@@ -433,18 +495,28 @@ class DecisionWorkspaceCTK:
             self.bom_section_var.set("SURFACE MOUNT")
         finally:
             self._suspend_bom_section_event = False
-
-        locked = bool(getattr(node, 'locked', False))
+    
+        locked = bool(getattr(node, "locked", False))
+    
+        # PN stays gated by reject-all (original behavior)
+        pn_unlock = (not locked) and all_rejected
+    
+        # Description should be editable whenever unlocked (your request)
+        desc_unlock = (not locked)
+    
         try:
             self.mark_ready_btn.configure(state=("disabled" if locked else "normal"))
             self.unmark_ready_btn.configure(state=("normal" if locked else "disabled"))
-            self.apply_pn_btn.configure(state=("disabled" if locked else "normal"))
-            self.company_pn_entry.configure(state=("disabled" if locked else "normal"))
             self.bom_section_menu.configure(state="normal")
-            # Auto reject should always be usable when a node is selected
             self.auto_reject_btn.configure(state="normal")
+    
+            self.company_pn_entry.configure(state=("normal" if pn_unlock else "disabled"))
+            self.apply_pn_btn.configure(state=("normal" if pn_unlock else "disabled"))
+    
+            self.desc_entry.configure(state=("normal" if desc_unlock else "disabled"))
         except Exception:
             pass
+
 
     def _render_cards(self, node: DecisionNode):
         for w in self.cards_scroll.winfo_children():
@@ -746,7 +818,9 @@ class DecisionWorkspaceCTK:
                 add_kv("MPN", line)
 
     def _specs_from_inventory(self, inv):
-        raw = dict(getattr(inv, "raw_fields", {}) or {})
+        _raw = dict(getattr(inv, "raw_fields", {}) or {})
+        # Normalize keys for case-insensitive lookups (inventory exports vary by header casing).
+        raw = {str(k).strip().lower(): v for k, v in _raw.items()}
         def pick(*keys):
             for k in keys:
                 v = raw.get(k, "")
@@ -1092,7 +1166,8 @@ class DecisionWorkspaceCTK:
         except Exception as e:
             messagebox.showerror("Apply PN Failed", str(e))
 
-
+    # TODO:
+    # post application of the applu_description make need to chnage the description of the node in UI to that of the chnaged description. In order to not change UI funcitlity of being a populated instance of the controller, INSTEAD of simply changing the panels and their descripion, inude and inidicator, maybe a badge orf sort, which indicated a changed description name, or pop open a hidden something in the header that shows that we changed that descirpion from the origianl one to the new one.The npr tool isnt set uop to handle changing the doccuments them selces (our inputs). therefore The descirption box for edition should only ever be opened up or placed into an unlocked state in the event that that all cards are rejected OR no cards are selected, the same applies for the apply button for the description. If a card is selcted and description apply button is selcted somehow then popup message an issue message and then reject the change. notifiy the user that becuase the part number is slected that this cannot be done as the part already exists in the company inventory. This same logic needs to be applied ot the comppnay part number button and chager. for now hide the COMN suggester, it is a feature which needs more work. 
     def _apply_description(self):
         node_id = self.current_node_id
         if not node_id:
@@ -1140,7 +1215,11 @@ class DecisionWorkspaceCTK:
             self._render_header_state(node)
             self.refresh_node_table()
         except Exception as e:
-            messagebox.showerror("Mark Ready Failed", str(e))
+            msg = str(e)
+            if "Description not confirmed" in msg:
+                messagebox.showwarning("Description Not Confirmed", msg)
+                return
+            messagebox.showerror("Mark Ready Failed", msg)
 
 
     def _on_auto_reject_all(self):

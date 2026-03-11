@@ -157,9 +157,7 @@ DEFAULT_NPR_ALIASES = HeaderAliases(
         "mfr_pn": "manufacturer_part_",
         "mfrp_n": "manufacturer_part_",
         "mfr_p_n": "manufacturer_part_",
-        # Manufacturer numbered columns
-        "manufacturer_1": "manufacturer_name",
-        "manufacturer1": "manufacturer_name",
+
 
         # MPN numbered columns (treat "1" as the primary MPN)
         "manufacturer_part_number_1": "manufacturer_part_",
@@ -191,10 +189,10 @@ DEFAULT_NPR_ALIASES = HeaderAliases(
         "pno": "part_number",
 
         # Often a stable BOM row ID
-        "reference": "part_number",
-        "refdes": "part_number",
-
+        "reference": "designator",
+        "refdes": "designator",
         "designator": "designator",
+        
         "footprint": "footprint",
         "subs_allowed": "subs_allowed",
         "name": "name",
@@ -210,6 +208,9 @@ DEFAULT_NPR_ALIASES = HeaderAliases(
         "manufacturer_name": "manufacturer_name",
         "mfr_name": "manufacturer_name",
         "mfg_name": "manufacturer_name",
+        
+        "manufacturer_1": "manufacturer_name",
+        "manufacturer1": "manufacturer_name",
 
         "supplier_name": "supplier",
         "vendor": "supplier",
