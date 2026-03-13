@@ -1,3 +1,86 @@
+"""
+The engine first tries exact and family-based deterministic matching, then performs semantic dense retrieval over inventory, 
+ applies sparse lexical rescoring to the shortlist, reranks the best candidates with a cross-encoder, and finally applies parsed 
+ engineering gates before selecting the final match.both models encode the BOM description at query time, but dense uses it for 
+ full-inventory retrieval while SPLADE uses it for shortlist rescoring. 
+ 
+ Step 1
+BOM description
+→ dense embed query once
+→ dot product against full inventory dense matrix
+→ sort by similarity
+→ keep top 250 inventory rows
+can change this to use splade as step one model instead thorugh ENG_PRIMARY_RETRIEVER set to "sparse"
+ 
+ Step 2
+ top 250 dense candidates
+→ SPLADE-encode BOM description once
+→ compare that sparse query only against those 250 cached sparse inventory doc vectors
+→ produce sparse scores for the shortlist (ENG_PRIMARY_RETRIEVER)
+ 
+ Step 3
+ dense top-250 scores
+ + sparse shortlist scores
+ → normalize both
+ → weighted combine
+ → produce seed score per candidate
+ That seed score is the pre-rerank ranking signal.
+ 
+ Step 4
+ hybrid-ranked candidate pool
+ → cap to ENG_TOPK_SECONDARY = 250
+ → take top ENG_RERANK_K = 80
+ → rerank only those 80 with cross-encoder
+ The reranker does pairwise scoring for each shortlisted candidate. It does not rerank the whole inventory
+
+ Step 5
+ After AI ranking, the engine applies deterministic parsed-field gates using _apply_parsed_gates()
+ the AI narrows and ranks candidates first, then structured engineering rules can remove bad fits.
+ 
+ Step 6
+ After gating, the engine returns the best candidate list, with the top winner becoming the MatchResult. 
+ If nothing survives or if retrieval fails badly enough, fuzzy fallback can be used as a last-resort retrieval source.
+ If all tiers fail, match_single_part() returns NO_MATCH
+ 
+ 
+ process flow summarized:
+
+ One BOM/NPR part
+ → exact MFGPN match?
+     → yes: return winner
+     → no: continue
+ 
+ → family filter seed generation from BOM MFGPN
+     → keep seed candidates for AI tier
+ 
+ → internal item number match?
+     → yes: return winner
+     → no: continue
+ 
+ → substitute / alias match?
+     → yes: return winner
+     → no: continue
+ 
+ → engineering AI tier
+     → ensure dense inventory cache exists
+     → ensure sparse inventory cache exists
+ 
+     → dense-encode BOM description
+     → compare against full inventory dense vectors
+     → keep top 250 dense candidates
+ 
+     → SPLADE-encode BOM description
+     → compare against cached sparse vectors for those 250 only
+     → get sparse shortlist scores
+ 
+     → normalize dense and sparse scores
+     → combine into hybrid seed score
+ 
+     → keep pool up to 250
+     → rerank top 80 with cross-encoder pairs
+     → apply parsed engineering gates
+     → return best 25 candidates, with top one as winner
+"""
 from __future__ import annotations
 
 
@@ -10,7 +93,10 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import threading
 from .data_models import MatchResult, MatchType, NPRPart
-from .config_loader import NPRConfig
+from .config_loader import NPRConfig, load_config
+from .parsing_engine import parse_description
+from .db import connect_db, init_db, DBConfig
+from .repositories import SpladeCacheRepo
 import tkinter
 from rapidfuzz import fuzz
 import re
@@ -112,6 +198,114 @@ FAM_NGRAM_MIN_SIM = 0.70
 ENG_TRACE_ENABLE = 0
 ENG_TRACE_PATH = "eng_trace.jsonl"   # relative to cache_dir
 ENG_TRACE_TOPN = 250                 # how many candidates to store per stage (save space or look and gander at everything set to size of ENG_TOPK_PRIMARY)
+
+
+_PARSER_CFG = None
+
+
+def _get_parser_cfg(config_path=None):
+    global _PARSER_CFG
+    if _PARSER_CFG is None:
+        try:
+            if config_path:
+                _PARSER_CFG = load_config(config_path)
+            else:
+                _PARSER_CFG = {}
+        except Exception:
+            _PARSER_CFG = {}
+    return _PARSER_CFG
+
+def _cfg_get(obj: Any, name: str, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+def _component_rule_for_type(type_name: str):
+    cfg = _get_parser_cfg()
+    comps = getattr(cfg, "components", {}) or {}
+    return comps.get(type_name) if type_name else None
+
+def _component_matching_rules(type_name: str) -> List[Dict[str, Any]]:
+    comp = _component_rule_for_type(type_name)
+    if not comp:
+        return []
+    matching = _cfg_get(comp, "matching", None)
+    rules = _cfg_get(matching, "rules", []) if matching is not None else []
+    out = []
+    for r in rules or []:
+        if isinstance(r, dict):
+            out.append(r)
+        else:
+            out.append({
+                "field": _cfg_get(r, "field", ""),
+                "mode": _cfg_get(r, "mode", ""),
+                "threshold": _cfg_get(r, "threshold", None),
+                "tolerance": _cfg_get(r, "tolerance", None),
+            })
+    return out
+
+def _canonical_field_alias(field: str) -> str:
+    f = str(field or "").strip().lower()
+    aliases = {
+        "value": "value",
+        "resistance": "resistance",
+        "capacitance": "capacitance",
+        "inductance": "inductance",
+        "voltage": "voltage",
+        "volts": "voltage",
+        "current": "current",
+        "amps": "current",
+        "power": "power",
+        "watts": "power",
+        "tolerance": "tolerance",
+        "percent": "tolerance",
+        "package": "package",
+        "standard": "package",
+        "mount": "mount",
+        "pins": "pins",
+        "pitch": "pitch",
+        "frequency": "frequency",
+        "frequency_hz": "frequency",
+        "description": "description",
+        "text": "description",
+    }
+    return aliases.get(f, f)
+
+def _parsed_value_by_field(parsed: Dict[str, Any], field: str):
+    p = parsed or {}
+    cf = _canonical_field_alias(field)
+    candidates = {
+        "resistance": ["resistance", "value"],
+        "capacitance": ["capacitance", "value"],
+        "inductance": ["inductance", "value"],
+        "voltage": ["voltage", "volts"],
+        "current": ["current", "amps"],
+        "power": ["power", "wattage", "watts"],
+        "tolerance": ["tolerance", "percent"],
+        "package": ["package", "standard"],
+        "mount": ["mount"],
+        "pins": ["pins"],
+        "pitch": ["pitch"],
+        "frequency": ["frequency", "frequency_hz"],
+        "description": ["description", "desc"],
+        "value": ["value"],
+    }.get(cf, [cf])
+    for key in candidates:
+        v = p.get(key)
+        if v not in (None, ""):
+            return v
+    return None
+
+def _float_or_none(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+def _str_norm(v):
+    return str(v or "").strip().upper()
 
 
 
@@ -231,6 +425,12 @@ class MatchingEngine:
         # Disk cache directory (relative to cwd by default)
         self.cache_dir = Path(cache_dir or ".npr_semantic_cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # SQLite-backed SPLADE row cache
+        self._cache_db_cfg = DBConfig()
+        self._cache_conn = connect_db(self._cache_db_cfg)
+        init_db(self._cache_conn)
+        self._splade_cache_repo = SpladeCacheRepo(self._cache_conn)
 
         # Precompute inventory MPN fields for fast family filtering
         # Raw vendoritem strings may be messy; we keep both raw and normalized forms.
@@ -545,11 +745,128 @@ class MatchingEngine:
         inv._pc_parsed_cache = out
         return out
 
-    def _splade_cache_paths(self) -> tuple[Path, Path]:
-        model_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(self.sparse_model_name))
-        vec_path = self.cache_dir / f"splade_{model_tag}_docs.npz"
-        meta_path = self.cache_dir / f"splade_{model_tag}_meta.json"
-        return vec_path, meta_path
+    def _splade_cfg_tuple(self) -> tuple[str, int, int, int]:
+        return (
+            str(self.sparse_model_name or ""),
+            int(_PREPROCESS_VERSION),
+            int(ENG_SPLADE_MAX_LEN),
+            int(ENG_SPLADE_TOP_TERMS),
+        )
+
+    def _splade_row_key(self, inv: Any, idx: int) -> str:
+        for attr in ("itemnum", "cpn", "vendoritem"):
+            try:
+                v = str(getattr(inv, attr, "") or "").strip()
+            except Exception:
+                v = ""
+            if v:
+                return v.upper()
+        return f"ROW-{idx}"
+
+    def _splade_row_hash(self, inv: Any) -> str:
+        desc = str(self._inv_desc(inv) or "")
+        payload = " ".join(desc.strip().upper().split())
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    def _splade_pack_row(self, ids: np.ndarray, wts: np.ndarray, norm: float) -> Dict[str, Any]:
+        ids = np.asarray(ids, dtype=np.int32)
+        wts = np.asarray(wts, dtype=np.float32)
+        return {
+            "term_ids_blob": ids.tobytes(),
+            "term_wts_blob": wts.tobytes(),
+            "doc_norm": float(norm or 1.0),
+        }
+
+    def _splade_unpack_row(self, row: Dict[str, Any]) -> tuple[np.ndarray, np.ndarray, float]:
+        ids_blob = row.get("term_ids_blob") or b""
+        wts_blob = row.get("term_wts_blob") or b""
+        ids = np.frombuffer(ids_blob, dtype=np.int32).copy()
+        wts = np.frombuffer(wts_blob, dtype=np.float32).copy()
+        norm = float(row.get("doc_norm", 1.0) or 1.0)
+        return ids, wts, norm
+
+    def _try_load_splade_doc_cache(self, row_keys: List[str], row_hashes: List[str]) -> bool:
+        if not ENG_SPARSE_CACHE_ENABLE:
+            return False
+        if len(row_keys) != len(row_hashes):
+            return False
+
+        model_name, preprocess_version, max_len, top_terms = self._splade_cfg_tuple()
+        try:
+            rows = self._splade_cache_repo.load_rows(
+                model_name=model_name,
+                preprocess_version=preprocess_version,
+                max_len=max_len,
+                top_terms=top_terms,
+                row_keys=row_keys,
+            )
+
+            term_ids: List[np.ndarray] = []
+            term_wts: List[np.ndarray] = []
+            doc_norms: List[float] = []
+            total = max(1, len(row_keys))
+
+            for idx, (row_key, row_hash) in enumerate(zip(row_keys, row_hashes), start=1):
+                cached = rows.get(row_key)
+                if not cached or str(cached.get("row_hash") or "") != str(row_hash):
+                    return False
+                ids, wts, norm = self._splade_unpack_row(cached)
+                term_ids.append(ids)
+                term_wts.append(wts)
+                doc_norms.append(norm)
+                if idx == total or idx % 250 == 0:
+                    self._emit_loading_progress(idx, total, f"Loading SPLADE cache {idx}/{total}")
+
+            self._splade_doc_term_ids = term_ids
+            self._splade_doc_term_wts = term_wts
+            self._splade_doc_norms = doc_norms
+            self._splade_doc_hash = "db-row-cache"
+            if ENG_DEBUG:
+                print(f"[SPLADE] loaded {len(term_ids)} doc vectors from SQLite cache.")
+            return True
+        except Exception as e:
+            if ENG_DEBUG:
+                print(f"[SPLADE] failed to load SQLite doc cache: {e}")
+            return False
+
+    def _save_splade_doc_cache(self, row_keys: List[str], row_hashes: List[str]) -> None:
+        if not ENG_SPARSE_CACHE_ENABLE:
+            return
+        if self._splade_doc_term_ids is None or self._splade_doc_term_wts is None or not self._splade_doc_norms:
+            return
+        if len(row_keys) != len(self._splade_doc_term_ids) or len(row_hashes) != len(row_keys):
+            return
+
+        model_name, preprocess_version, max_len, top_terms = self._splade_cfg_tuple()
+        try:
+            packed_rows: List[Dict[str, Any]] = []
+            for row_key, row_hash, ids, wts, norm in zip(
+                row_keys, row_hashes, self._splade_doc_term_ids, self._splade_doc_term_wts, self._splade_doc_norms
+            ):
+                payload = self._splade_pack_row(ids, wts, norm)
+                payload["row_key"] = row_key
+                payload["row_hash"] = row_hash
+                packed_rows.append(payload)
+
+            self._splade_cache_repo.upsert_rows(
+                model_name=model_name,
+                preprocess_version=preprocess_version,
+                max_len=max_len,
+                top_terms=top_terms,
+                rows=packed_rows,
+            )
+            self._splade_cache_repo.prune_missing_row_keys(
+                model_name=model_name,
+                preprocess_version=preprocess_version,
+                max_len=max_len,
+                top_terms=top_terms,
+                active_row_keys=row_keys,
+            )
+            if ENG_DEBUG:
+                print(f"[SPLADE] saved {len(packed_rows)} doc vectors to SQLite cache.")
+        except Exception as e:
+            if ENG_DEBUG:
+                print(f"[SPLADE] failed to save SQLite doc cache: {e}")
 
     #TODO: concern need to address for scope
     # One concern with this is that the matching engine is now out of scope as well. concern: the matching engine instead of piping data over to the ui for display is making its own data/
@@ -565,6 +882,66 @@ class MatchingEngine:
             return getattr(tkinter, "_default_root", None)
         except Exception:
             return None
+
+    def _ui_invoke(self, cb, *args):
+        if cb is None:
+            return
+        root = self._get_ui_root()
+
+        def _call():
+            try:
+                cb(*args)
+                return
+            except TypeError:
+                # Support both ratio-only progress callbacks and controller-style callbacks.
+                pass
+            if len(args) == 3:
+                cur, total, label = args
+                try:
+                    cb(cur / total if total else 0.0)
+                    return
+                except Exception:
+                    pass
+                try:
+                    cb(label)
+                    return
+                except Exception:
+                    pass
+            elif len(args) == 2:
+                try:
+                    cb(args[0])
+                    return
+                except Exception:
+                    pass
+            elif len(args) == 1:
+                try:
+                    cb(args[0])
+                    return
+                except Exception:
+                    pass
+
+        try:
+            if root is not None and root.winfo_exists():
+                root.after(0, _call)
+            else:
+                _call()
+        except Exception:
+            try:
+                _call()
+            except Exception:
+                pass
+
+    def _emit_loading_phase(self, label: str, indeterminate: bool = True) -> None:
+        root = self._get_ui_root()
+        cb = getattr(root, "loading_phase_callback", None) if root else None
+        self._ui_invoke(cb, str(label or ""), bool(indeterminate))
+
+    def _emit_loading_progress(self, cur: int, total: int, label: str = "") -> None:
+        total_i = max(1, int(total or 1))
+        cur_i = max(0, min(int(cur or 0), total_i))
+        root = self._get_ui_root()
+        cb = getattr(root, "loading_progress_callback", None) if root else None
+        self._ui_invoke(cb, cur_i, total_i, str(label or ""))
 
 
     # -----------------------------
@@ -725,106 +1102,6 @@ class MatchingEngine:
     # There is a need to restrucutre and rename the nameing conventions of the matching engine to not be speicific towards the ai semantic embeddeding sparse and re rankers.
     # This way swapping models would be more intuitive. scability will increase as well. 
 
-    def _try_load_splade_doc_cache(self) -> bool:
-        if not ENG_SPARSE_CACHE_ENABLE:
-            return False
-
-        vec_path, meta_path = self._splade_cache_paths()
-        if not vec_path.exists() or not meta_path.exists():
-            return False
-
-        expected = {
-            "model_name": self.sparse_model_name,
-            "preprocess_version": _PREPROCESS_VERSION,
-            "max_len": int(ENG_SPLADE_MAX_LEN),
-            "top_terms": int(ENG_SPLADE_TOP_TERMS),
-            "inventory_hash": self._inv_fingerprint(),
-        }
-
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if any(meta.get(k) != v for k, v in expected.items()):
-                return False
-
-            with np.load(vec_path, allow_pickle=False) as data:
-                ids_flat = data["ids_flat"]
-                wts_flat = data["wts_flat"]
-                offsets = data["offsets"]
-                doc_norms = data["doc_norms"].tolist()
-
-            term_ids = []
-            term_wts = []
-            for i in range(len(offsets) - 1):
-                a = int(offsets[i])
-                b = int(offsets[i + 1])
-                term_ids.append(ids_flat[a:b].copy())
-                term_wts.append(wts_flat[a:b].copy())
-
-            self._splade_doc_term_ids = term_ids
-            self._splade_doc_term_wts = term_wts
-            self._splade_doc_norms = doc_norms
-            self._splade_doc_hash = expected["inventory_hash"]
-
-            if ENG_DEBUG:
-                print(f"[SPLADE] loaded doc cache: {vec_path.name}")
-            return True
-
-        except Exception as e:
-            if ENG_DEBUG:
-                print(f"[SPLADE] failed to load doc cache: {e}")
-            return False
-
-    # Splade cahching works, but an issue with it is that unlike the embeded, any change to the input BOM changes cuases a complete reworking of th esplade model, meaning we have to wait or all 5000+ splade thingies to do things
-    def _save_splade_doc_cache(self) -> None:
-        if not ENG_SPARSE_CACHE_ENABLE:
-            return
-        if self._splade_doc_term_ids is None or self._splade_doc_term_wts is None or not self._splade_doc_norms:
-            return
-
-        inv_hash = self._inv_fingerprint()
-        vec_path, meta_path = self._splade_cache_paths()
-
-        meta = {
-            "model_name": self.sparse_model_name,
-            "preprocess_version": _PREPROCESS_VERSION,
-            "max_len": int(ENG_SPLADE_MAX_LEN),
-            "top_terms": int(ENG_SPLADE_TOP_TERMS),
-            "inventory_hash": inv_hash,
-            "format": "flat+offsets",
-        }
-
-        try:
-            # Flatten ragged (ids,wts) into one big array + offsets
-            offsets = [0]
-            ids_all = []
-            wts_all = []
-            for ids, wts in zip(self._splade_doc_term_ids, self._splade_doc_term_wts):
-                ids = np.asarray(ids, dtype=np.int32)
-                wts = np.asarray(wts, dtype=np.float32)
-                ids_all.append(ids)
-                wts_all.append(wts)
-                offsets.append(offsets[-1] + len(ids))
-
-            ids_flat = np.concatenate(ids_all, axis=0) if ids_all else np.array([], dtype=np.int32)
-            wts_flat = np.concatenate(wts_all, axis=0) if wts_all else np.array([], dtype=np.float32)
-            offsets = np.asarray(offsets, dtype=np.int64)
-            doc_norms = np.asarray(self._splade_doc_norms, dtype=np.float32)
-
-            np.savez_compressed(
-                str(vec_path),
-                ids_flat=ids_flat,
-                wts_flat=wts_flat,
-                offsets=offsets,
-                doc_norms=doc_norms,
-            )
-            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-            if ENG_DEBUG:
-                print(f"[SPLADE] saved doc cache: {vec_path.name}")
-        except Exception as e:
-            if ENG_DEBUG:
-                print(f"[SPLADE] failed to save doc cache: {e}")
-
     def _splade_ensure_model(self) -> None:
         if self._splade_model is not None:
             return
@@ -878,7 +1155,7 @@ class MatchingEngine:
     def ensure_splade_index(self, *, force: bool = False) -> None:
         """
         Ensure SPLADE doc vectors exist (and optionally an inverted index for full retrieval).
-        Uses optional disk cache to avoid rebuild cost.
+        Uses SQLite row cache to avoid rebuild cost on unchanged inventory rows.
         """
         if self._splade_ready and (not force):
             return
@@ -890,59 +1167,104 @@ class MatchingEngine:
             t0 = time.time()
             inv_n = len(self.inventory or [])
             print(f"[SPLADE] ensure_splade_index(force={force}) for {inv_n} inventory rows...")
+            self._emit_loading_phase("Building SPLADE cache.", True)
+            self._emit_loading_progress(0, max(1, inv_n), "Preparing SPLADE cache")
 
-            # Try disk cache first
-            if (not force) and self._try_load_splade_doc_cache():
-                # Optionally rebuild inverted index from cached doc vectors
+            self._splade_docs = [self._inv_desc(inv) for inv in self.inventory]
+            row_keys = [self._splade_row_key(inv, i) for i, inv in enumerate(self.inventory or [])]
+            row_hashes = [self._splade_row_hash(inv) for inv in (self.inventory or [])]
+
+            if (not force) and self._try_load_splade_doc_cache(row_keys, row_hashes):
                 if ENG_SPARSE_CACHE_BUILD_INV_INDEX:
+                    total_docs = max(1, len(self._splade_doc_term_ids or []))
                     print(f"[SPLADE] rebuilding inverted index from cached vectors...")
+                    self._emit_loading_phase("Finalizing SPLADE cache.", True)
                     self._splade_inv_index.clear()
-                    for di, (ids, wts) in enumerate(zip(self._splade_doc_term_ids, self._splade_doc_term_wts)):
+                    for di, (ids, wts) in enumerate(zip(self._splade_doc_term_ids, self._splade_doc_term_wts), start=1):
                         if di and (di % 1000 == 0):
                             print(f"[SPLADE] inv-index rebuild: {di}/{len(self._splade_doc_term_ids)} ({time.time()-t0:.1f}s)")
                         for tid, wt in zip(ids.tolist(), wts.tolist()):
-                            self._splade_inv_index[int(tid)].append((di, float(wt)))
-
+                            self._splade_inv_index[int(tid)].append((di - 1, float(wt)))
+                        if di == total_docs or di % 250 == 0:
+                            self._emit_loading_progress(di, total_docs, f"Finalizing SPLADE cache {di}/{total_docs}")
                 self._splade_ready = True
+                self._emit_loading_progress(max(1, inv_n), max(1, inv_n), "SPLADE cache ready")
                 print(f"[SPLADE] doc cache ready ({time.time()-t0:.1f}s)")
                 return
 
-            # Build fresh
+            self._emit_loading_phase("Loading SPLADE model.", True)
             self._splade_ensure_model()
-
             self._splade_inv_index.clear()
-            self._splade_docs = [self._inv_desc(inv) for inv in self.inventory]
             self._splade_doc_norms = []
             self._splade_doc_term_ids = []
             self._splade_doc_term_wts = []
 
-            for di, doc in enumerate(self._splade_docs):
-                if di and (di % 500 == 0):
-                    print(f"[SPLADE] building doc vectors: {di}/{len(self._splade_docs)} ({time.time()-t0:.1f}s)")
+            model_name, preprocess_version, max_len, top_terms = self._splade_cfg_tuple()
+            existing = {} if force else self._splade_cache_repo.load_rows(
+                model_name=model_name,
+                preprocess_version=preprocess_version,
+                max_len=max_len,
+                top_terms=top_terms,
+                row_keys=row_keys,
+            )
+            to_upsert: List[Dict[str, Any]] = []
+            total_docs = max(1, len(self._splade_docs))
+            self._emit_loading_phase("Building SPLADE doc vectors.", True)
 
-                sparse = self._splade_encode_sparse(
-                    doc,
-                    max_length=ENG_SPLADE_MAX_LEN,
-                    top_terms=ENG_SPLADE_TOP_TERMS
-                )
+            for di, (inv, doc, row_key, row_hash) in enumerate(zip(self.inventory or [], self._splade_docs, row_keys, row_hashes), start=1):
+                if di > 1 and ((di - 1) % 500 == 0):
+                    print(f"[SPLADE] preparing doc vectors: {di - 1}/{len(self._splade_docs)} ({time.time()-t0:.1f}s)")
 
-                # store compact doc vector
-                ids = np.array(list(sparse.keys()), dtype=np.int32)
-                wts = np.array(list(sparse.values()), dtype=np.float32)
+                cached = None if force else existing.get(row_key)
+                if cached and str(cached.get("row_hash") or "") == row_hash:
+                    ids, wts, norm = self._splade_unpack_row(cached)
+                else:
+                    sparse = self._splade_encode_sparse(
+                        doc,
+                        max_length=ENG_SPLADE_MAX_LEN,
+                        top_terms=ENG_SPLADE_TOP_TERMS
+                    )
+                    ids = np.array(list(sparse.keys()), dtype=np.int32)
+                    wts = np.array(list(sparse.values()), dtype=np.float32)
+                    norm2 = float(np.dot(wts, wts)) if len(wts) else 0.0
+                    norm = (norm2 ** 0.5) if norm2 > 0 else 1.0
+                    packed = self._splade_pack_row(ids, wts, norm)
+                    packed["row_key"] = row_key
+                    packed["row_hash"] = row_hash
+                    to_upsert.append(packed)
+
                 self._splade_doc_term_ids.append(ids)
                 self._splade_doc_term_wts.append(wts)
-
-                norm2 = float(np.dot(wts, wts)) if len(wts) else 0.0
-                self._splade_doc_norms.append((norm2 ** 0.5) if norm2 > 0 else 1.0)
+                self._splade_doc_norms.append(norm)
 
                 if ENG_SPARSE_CACHE_BUILD_INV_INDEX:
-                    for tid, wt in sparse.items():
-                        self._splade_inv_index[int(tid)].append((di, float(wt)))
+                    for tid, wt in zip(ids.tolist(), wts.tolist()):
+                        self._splade_inv_index[int(tid)].append((di - 1, float(wt)))
 
-            # Save cache
-            self._save_splade_doc_cache()
+                if di == total_docs or di % 25 == 0:
+                    self._emit_loading_progress(di, total_docs, f"Building SPLADE doc vectors {di}/{total_docs}")
+
+            if ENG_SPARSE_CACHE_ENABLE:
+                if to_upsert:
+                    self._emit_loading_phase("Saving SPLADE cache.", True)
+                    self._splade_cache_repo.upsert_rows(
+                        model_name=model_name,
+                        preprocess_version=preprocess_version,
+                        max_len=max_len,
+                        top_terms=top_terms,
+                        rows=to_upsert,
+                    )
+                self._splade_cache_repo.prune_missing_row_keys(
+                    model_name=model_name,
+                    preprocess_version=preprocess_version,
+                    max_len=max_len,
+                    top_terms=top_terms,
+                    active_row_keys=row_keys,
+                )
+
             self._splade_ready = True
-            print(f"[SPLADE] index ready (built) ({time.time()-t0:.1f}s)")
+            self._emit_loading_progress(total_docs, total_docs, "SPLADE cache ready")
+            print(f"[SPLADE] index ready ({'rebuilt' if force else 'incremental'}) ({time.time()-t0:.1f}s)")
 
     def _splade_score_shortlist(self, query: str, cand_indices: List[int]) -> List[float]:
         """
@@ -1068,84 +1390,26 @@ class MatchingEngine:
     # 2: in the matching logic, when given a part number from a BOM, we need to attach a ptype match to each part SOMEHOW. then when comparing against the inventory, we need to make sure that ptypes match (lowering the pool of data it needs to sluth through reducing error margins)
 
     def _ptype_signal(self, obj: Any) -> Dict[str, Any]:
-        """
-        Returns a dict:
-          {
-            "ptype": "RESISTOR"|"CAPACITOR"|"INDUCTOR"|"DIODE"|"OTHER",
-            "confidence": 0..1,
-            "source": "cns"|"parsed"|"unknown"
-          }
-
-        Notes:
-        - We treat OTHER as "unknown-ish": do NOT hard-gate on it.
-        - If CNS (or other authoritative upstream) provides a type, it wins.
-        """
+        """Use authoritative parsed type/category when available."""
         p = self._safe_get_parsed(obj)
-
-        # 1) Authoritative hint (optional): if you ever attach CNS-derived type to parsed
-        #    e.g. p["cns_type"] = "CAP", treat as highest confidence.
         raw = (p.get("cns_type") or p.get("type") or p.get("component") or p.get("kind") or "")
         raw_u = str(raw).strip().upper()
-
-        # Map to buckets
-        if raw_u in ("RES", "RESISTOR"):
-            ptype = "RESISTOR"
-            src = "parsed" if "cns_type" not in p else "cns"
-        elif raw_u in ("CAP", "CAPACITOR"):
-            ptype = "CAPACITOR"
-            src = "parsed" if "cns_type" not in p else "cns"
-        elif raw_u in ("IND", "INDUCTOR"):
-            ptype = "INDUCTOR"
-            src = "parsed" if "cns_type" not in p else "cns"
-        elif raw_u in ("DIODE", "TVS", "ZENER"):
-            ptype = "DIODE"
-            src = "parsed" if "cns_type" not in p else "cns"
-        else:
-            ptype = "OTHER"
-            src = "unknown"
-
-        # Confidence: prefer config-driven scales if present
-        #  DEFAULT_TYPE_CONFIDENCE uses keys like "RES","CAP","DIODE","OTHER" :contentReference[oaicite:2]{index=2}
-        key = {
-            "RESISTOR": "RES",
-            "CAPACITOR": "CAP",
-            "INDUCTOR": "IND",
-            "DIODE": "DIODE",
-            "OTHER": "OTHER",
-        }.get(ptype, "OTHER")
-
-        conf = float(self.type_confidence.get(key, 0.7))
-        if src == "cns":
-            conf = max(conf, 0.95)
-
-        # Attach to object for controller/UI (engine-owned signal)
+        src = "cns" if p.get("cns_type") else ("parsed" if raw_u else "unknown")
+        conf = 0.95 if src == "cns" else (0.85 if raw_u else 0.5)
         try:
-            setattr(obj, "_pc_ptype", ptype)
+            setattr(obj, "_pc_ptype", raw_u or "OTHER")
             setattr(obj, "_pc_ptype_conf", conf)
             setattr(obj, "_pc_ptype_src", src)
         except Exception:
             pass
+        return {"ptype": raw_u or "OTHER", "confidence": conf, "source": src}
 
-        return {"ptype": ptype, "confidence": conf, "source": src}
-    
-
-    
     def _ptype(self, parsed: Dict[str, Any]) -> str:
-        # Backward-compatible wrapper: "ptype bucket only"
-        t = (parsed.get("type") or parsed.get("component") or parsed.get("kind") or "").strip().upper()
-        if t in ("RES", "RESISTOR"):
-            return "RESISTOR"
-        if t in ("CAP", "CAPACITOR"):
-            return "CAPACITOR"
-        if t in ("IND", "INDUCTOR"):
-            return "INDUCTOR"
-        if t in ("DIODE", "TVS", "ZENER"):
-            return "DIODE"
-        return "OTHER"
+        if not isinstance(parsed, dict):
+            return "OTHER"
+        raw = str(parsed.get("cns_type") or parsed.get("type") or parsed.get("component") or parsed.get("kind") or "").strip().upper()
+        return raw or "OTHER"
 
-
-
-    # really need to offload all of this parsing to th eparsing engine itself. keep within the scope of the file.
     def _norm_pkg(self, x: str) -> str:
         s = (x or "").strip().upper()
         return s.replace(" ", "").replace("-", "").replace("_", "")
@@ -1188,63 +1452,88 @@ class MatchingEngine:
         except Exception:
             return ""
 
+    def _parsed_pkg(self, parsed: Dict[str, Any]) -> str:
+        return self._norm_pkg(str((parsed or {}).get("package") or (parsed or {}).get("standard") or ""))
+
+    def _parsed_res_ohms(self, parsed: Dict[str, Any]) -> Optional[float]:
+        try:
+            v = (parsed or {}).get("resistance")
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _parsed_cap_farads(self, parsed: Dict[str, Any]) -> Optional[float]:
+        try:
+            v = (parsed or {}).get("capacitance")
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _parsed_ind_henries(self, parsed: Dict[str, Any]) -> Optional[float]:
+        try:
+            v = (parsed or {}).get("inductance")
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
     def _apply_parsed_gates(self, npr: NPRPart, candidates: List[Any]) -> List[Any]:
-        """
-        Deterministic safety gates.
-
-        Rules:
-        - NEVER use confidence for logic.
-        - Only gate when ptype is a known family where gates are meaningful.
-        - Only gate on a field if BOTH sides parse/normalize that field cleanly.
-        - If ptype is OTHER/unknown -> DO NOT gate (avoid coding out matches).
-        """
+        """Apply YAML-driven parsed-field gates over the semantic candidate list."""
         npr_p = self._safe_get_parsed(npr)
-        n_type = self._ptype(npr_p)  # bucket only: RESISTOR/CAPACITOR/INDUCTOR/DIODE/OTHER
-        
-
-        # If we don't know the family, don't gate at all.
-        if n_type == "OTHER":
+        n_type = self._ptype(npr_p)
+        rules = _component_matching_rules(n_type)
+        if not rules:
             return list(candidates or [])
-
-        # Extract/normalize NPR fields
-        n_pkg = self._norm_pkg(str(npr_p.get("package") or getattr(npr, "package", "") or ""))
-        n_val = str(npr_p.get("value") or getattr(npr, "value", "") or "").strip()
-
-        n_res = self._norm_res_value(n_val) if n_type == "RESISTOR" else ""
-        n_cap = self._norm_cap_value(n_val) if n_type == "CAPACITOR" else ""
 
         out = []
         for inv in (candidates or []):
             ip = self._get_or_parse_inv_fields(inv)
             i_type = self._ptype(ip)
-
-            # Type gate ONLY if BOTH are known (not OTHER)
-            if i_type != "OTHER" and i_type != n_type:
+            if n_type != "OTHER" and i_type not in ("", "OTHER", n_type):
                 continue
 
-            # Package gate for passives ONLY if both packages exist
-            if n_type in {"RESISTOR", "CAPACITOR", "INDUCTOR"}:
-                i_pkg = self._norm_pkg(str(ip.get("package") or getattr(inv, "package", "") or ""))
-                if n_pkg and i_pkg and n_pkg != i_pkg:
+            keep = True
+            for rule in rules:
+                field = str(rule.get("field", "") or "").strip()
+                mode = str(rule.get("mode", "") or "").strip().lower()
+                if not field or mode in {"hybrid", "semantic", "text", "range"}:
                     continue
 
-            # Value gate only when both normalize cleanly
-            if n_type == "RESISTOR":
-                i_val = str(ip.get("value") or getattr(inv, "value", "") or "").strip()
-                i_res = self._norm_res_value(i_val)
-                if n_res and i_res and n_res != i_res:
+                left = _parsed_value_by_field(npr_p, field)
+                right = _parsed_value_by_field(ip, field)
+                if left in (None, "") or right in (None, ""):
                     continue
 
-            if n_type == "CAPACITOR":
-                i_val = str(ip.get("value") or getattr(inv, "value", "") or "").strip()
-                i_cap = self._norm_cap_value(i_val)
-                if n_cap and i_cap and n_cap != i_cap:
-                    continue
+                cf = _canonical_field_alias(field)
+                if cf == "package":
+                    lv = self._norm_pkg(str(left))
+                    rv = self._norm_pkg(str(right))
+                elif cf == "mount":
+                    lv = _str_norm(left)
+                    rv = _str_norm(right)
+                elif cf in {"resistance", "capacitance", "inductance", "voltage", "current", "power", "tolerance", "pins", "pitch", "frequency"}:
+                    lv = _float_or_none(left)
+                    rv = _float_or_none(right)
+                    if lv is None or rv is None:
+                        continue
+                else:
+                    lv = _str_norm(left)
+                    rv = _str_norm(right)
 
-            # Diodes: add gates later (polarity/package/voltage) if want
+                if mode == "eq":
+                    if lv != rv:
+                        keep = False
+                        break
+                elif mode in {"gte", "min"}:
+                    if rv < lv:
+                        keep = False
+                        break
+                elif mode in {"lte", "max"}:
+                    if rv > lv:
+                        keep = False
+                        break
 
-            out.append(inv)
-
+            if keep:
+                out.append(inv)
         return out
 
     def _fuzzy_fallback_candidates(self, query_desc: str, top_k: int) -> List[tuple[int, float]]:

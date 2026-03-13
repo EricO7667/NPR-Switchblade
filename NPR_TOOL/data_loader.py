@@ -7,11 +7,14 @@ import tempfile
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 
 from .data_models import InventoryPart, NPRPart, CNSRecord, SubstitutePart
+from .parsing_engine import parse_description
+from .config_loader import load_config
 
 
 PB_RE = re.compile(r"\b(\d{2})\s*-\s*(\d{5})\b")
@@ -20,6 +23,35 @@ BODY_RE = re.compile(r"^\s*(\d{5})\s*$")
 
 # 1 = always read a copied file (cached first), 0 = try direct then fallback
 SAFE_SHARED_FILE_READS = 1
+
+
+# =====================================================
+# Shared description parsing helper
+# =====================================================
+_PARSER_CFG = None
+
+def _get_parser_cfg(config_path=None):
+    global _PARSER_CFG
+    if _PARSER_CFG is None:
+        try:
+            if config_path:
+                _PARSER_CFG = load_config(config_path)
+            else:
+                _PARSER_CFG = {}
+        except Exception:
+            _PARSER_CFG = {}
+    return _PARSER_CFG
+
+
+def _parse_desc_fields(desc: str) -> Dict[str, object]:
+    desc = safe_str(desc)
+    if not desc:
+        return {}
+    try:
+        parsed = parse_description(desc, _get_parser_cfg()) or {}
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
 
 # =====================================================
 # Small helpers
@@ -156,7 +188,7 @@ DEFAULT_NPR_ALIASES = HeaderAliases(
         "mfrpn": "manufacturer_part_",
         "mfr_pn": "manufacturer_part_",
         "mfrp_n": "manufacturer_part_",
-        "mfr_p_n": "manufacturer_part_",
+        "mfr_p_n": "manufacturer_part_",    
 
 
         # MPN numbered columns (treat "1" as the primary MPN)
@@ -187,6 +219,7 @@ DEFAULT_NPR_ALIASES = HeaderAliases(
         "part_no": "part_number",
         "part": "part_number",
         "pno": "part_number",
+        
 
         # Often a stable BOM row ID
         "reference": "designator",
@@ -208,6 +241,7 @@ DEFAULT_NPR_ALIASES = HeaderAliases(
         "manufacturer_name": "manufacturer_name",
         "mfr_name": "manufacturer_name",
         "mfg_name": "manufacturer_name",
+        "mfr": "manufacturer_name",
         
         "manufacturer_1": "manufacturer_name",
         "manufacturer1": "manufacturer_name",
@@ -691,7 +725,7 @@ class DataLoader:
                 mfgname=safe_str(row.get("mfgname", "")),
                 vendoritem=vendoritem,
                 raw_fields=raw_fields,
-                parsed={},
+                parsed=_parse_desc_fields(desc),
             )
             inventory_parts.append(inv)
 
@@ -758,7 +792,7 @@ class DataLoader:
                     mfgname=mfgname,
                     vendoritem=rep_vendoritem,
                     raw_fields=raw_fields,
-                    parsed={},
+                    parsed=_parse_desc_fields(desc),
                 )
                 subs_by_base.setdefault(base_item, [])
 
@@ -934,6 +968,8 @@ class DataLoader:
         *,
         erp_inventory_path: Optional[str] = None,
         alt_aliases: HeaderAliases = DEFAULT_ALT_ALIASES,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+        parse_workers: int = 8,
     ) -> tuple[List[dict], List[InventoryPart]]:
         """Build inventory_company rows for DB persistence + a flat InventoryPart list for matching.
 
@@ -945,7 +981,6 @@ class DataLoader:
 
         header_row = DataLoader._find_header_row_by_keywords(
             raw,
-            # include vendor/item wording because many master exports use VendorItem instead of Manufacturer PN
             required_keywords=["item", "description", "manufacturer", "pn", "vendor"],
             scan_rows=50,
         )
@@ -953,8 +988,6 @@ class DataLoader:
         df = read_excel_with_temp_copy(master_inventory_path, header=header_row, dtype=str).fillna("")
         df = DataLoader._normalize_and_alias_columns(df, alt_aliases)
 
-        # Fallback normalization: some master inventory extracts label the MPN column as VendorItem.
-        # If aliasing did not create mfgpn, map vendoritem/vendor_item style columns into mfgpn.
         if "mfgpn" not in df.columns:
             for c in list(df.columns):
                 lc = str(c).strip().lower()
@@ -966,7 +999,6 @@ class DataLoader:
         if "itemnum" not in df.columns:
             raise ValueError(f"Master inventory missing itemnum column. Detected: {list(df.columns)}")
 
-        # Optional ERP stock totals
         stock_totals: Dict[str, int] = {}
         if erp_inventory_path:
             try:
@@ -986,12 +1018,43 @@ class DataLoader:
             except Exception:
                 return None
 
-        for _, row in df.iterrows():
+        unique_descs = sorted({
+            safe_str(row.get("desc", "")).strip()
+            for _, row in df.iterrows()
+            if safe_str(row.get("desc", "")).strip()
+        })
+
+        parsed_cache: Dict[str, Dict[str, object]] = {}
+        if unique_descs:
+            total_descs = len(unique_descs)
+            workers = max(1, int(parse_workers or 1))
+            if workers == 1 or total_descs == 1:
+                for i, desc in enumerate(unique_descs, start=1):
+                    parsed_cache[desc] = _parse_desc_fields(desc)
+                    if progress_cb:
+                        progress_cb(i, total_descs, f"Parsing descriptions {i}/{total_descs}")
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    future_to_desc = {ex.submit(_parse_desc_fields, desc): desc for desc in unique_descs}
+                    done = 0
+                    for fut in as_completed(future_to_desc):
+                        desc = future_to_desc[fut]
+                        try:
+                            parsed_cache[desc] = fut.result() or {}
+                        except Exception:
+                            parsed_cache[desc] = {}
+                        done += 1
+                        if progress_cb:
+                            progress_cb(done, total_descs, f"Parsing descriptions {done}/{total_descs}")
+
+        total_rows = len(df.index)
+        for row_num, (_, row) in enumerate(df.iterrows(), start=1):
             cpn = safe_str(row.get("itemnum", "")).strip()
             if not cpn:
                 continue
 
             desc = safe_str(row.get("desc", "")).strip()
+            parsed = parsed_cache.get(desc, {}) if desc else {}
             mfgname = safe_str(row.get("mfgname", "")).strip()
             mfgid = safe_str(row.get("mfgid", "")).strip()
             mpn = DataLoader.clean_mpn(safe_str(row.get("mfgpn", "") or row.get("vendoritem", "")))
@@ -1006,12 +1069,15 @@ class DataLoader:
                 grouped[cpn] = {
                     "cpn": cpn,
                     "canonical_desc": desc,
+                    "parsed": parsed,
                     "stock_total": int(stock_totals.get(cpn, 0) or 0),
                     "alternates": [],
                 }
             else:
                 if desc and not grouped[cpn].get("canonical_desc"):
                     grouped[cpn]["canonical_desc"] = desc
+                if parsed and not grouped[cpn].get("parsed"):
+                    grouped[cpn]["parsed"] = parsed
 
             if mpn or mfgname or mfgid:
                 grouped[cpn]["alternates"].append(
@@ -1019,7 +1085,6 @@ class DataLoader:
                         "mfgname": mfgname,
                         "mfgid": mfgid,
                         "mpn": mpn,
-                        # keep both “current” and “last” price fields if available
                         "unit_price": average_cost if average_cost is not None else last_cost,
                         "last_unit_price": last_cost,
                         "standard_cost": standard_cost,
@@ -1030,7 +1095,6 @@ class DataLoader:
                     }
                 )
 
-                # Flat inventory record for matching (legacy-compatible)
                 flat.append(
                     InventoryPart(
                         itemnum=cpn,
@@ -1039,16 +1103,19 @@ class DataLoader:
                         mfgname=mfgname,
                         vendoritem=mpn,
                         raw_fields={k: safe_str(row.get(k, "")) for k in df.columns},
-                        parsed={},
+                        parsed=parsed,
                     )
                 )
 
-        # If ERP stock was provided, ensure all known stock-only parts exist too
+            if progress_cb and (row_num % 100 == 0 or row_num == total_rows):
+                progress_cb(row_num, total_rows, f"Building company inventory {row_num}/{total_rows}")
+
         for cpn, qty in (stock_totals or {}).items():
             if cpn not in grouped:
                 grouped[cpn] = {
                     "cpn": cpn,
                     "canonical_desc": "",
+                    "parsed": {},
                     "stock_total": int(qty or 0),
                     "alternates": [],
                 }
@@ -1056,7 +1123,6 @@ class DataLoader:
                 grouped[cpn]["stock_total"] = int(qty or 0)
 
         return list(grouped.values()), flat
-
 
     # =====================================================
     # NPR / BOM SHEET
@@ -1140,7 +1206,7 @@ class DataLoader:
             if not desc and not primary_mpn and not alt_mpns:
                 continue
 
-            parsed = {}
+            parsed = _parse_desc_fields(desc)
             if alt_mpns:
                 parsed["mpn_alts"] = alt_mpns
 
@@ -1213,7 +1279,7 @@ class DataLoader:
                     mfgpn=mpn_val,
                     supplier="",
                     raw_fields={str(k): safe_str(v) for k, v in dict(row).items()},
-                    parsed={},
+                    parsed=_parse_desc_fields(desc_val),
                 )
             )
         return parts

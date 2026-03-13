@@ -1,0 +1,7 @@
+{
+  "model_name": "naver/splade-cocondenser-ensembledistil",
+  "preprocess_version": 1,
+  "max_len": 128,
+  "top_terms": 256,
+  "format": "per-row-v1"
+}

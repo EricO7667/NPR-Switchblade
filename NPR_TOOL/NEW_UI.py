@@ -11,8 +11,12 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from .decision_controller import DecisionController
 from .data_models import DecisionNode, DecisionStatus, Alternate
+from typing import TYPE_CHECKING
+import time
+
+if TYPE_CHECKING:
+    from .NEW_decision_controller import DecisionController
 
 
 class DecisionWorkspaceCTK:
@@ -23,7 +27,7 @@ class DecisionWorkspaceCTK:
       - renders always pull fresh state from controller
     """
 
-    def __init__(self, root: ctk.CTk, controller: DecisionController):
+    def __init__(self, root: ctk.CTk, controller: "DecisionController"):
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
 
@@ -36,6 +40,15 @@ class DecisionWorkspaceCTK:
 
         self._stop_event = threading.Event()
         self.controller.stop_event = self._stop_event
+
+        # Shared progress callbacks used by inventory loading and matching-engine cache builds.
+        self.root.loading_progress_callback = self._loading_progress_callback
+        self.root.loading_phase_callback = self._loading_phase_callback
+        self._loading_win = None
+        self._loading_phase_var = None
+        self._loading_detail_var = None
+        self._loading_bar = None
+        self._loading_started_at = 0.0
 
         self.current_node_id: Optional[str] = None
         self._pinned_alt_id: Optional[str] = None
@@ -68,6 +81,7 @@ class DecisionWorkspaceCTK:
         self._render_empty_state()
 
         self._suspend_desc_trace = False
+        self._suspend_approval_toggle = False
         self.desc_var.trace_add("write", self._on_desc_var_changed)
 
     # ---------------------------------------------------------------------
@@ -272,6 +286,16 @@ class DecisionWorkspaceCTK:
         self.desc_entry = ctk.CTkEntry(desc_row, width=720, textvariable=self.desc_var)
         self.desc_entry.pack(side="left", padx=(0, 10))
 
+        approval_row = ctk.CTkFrame(parent, fg_color="transparent")
+        approval_row.pack(pady=(0, 10), fill="x")
+        self.include_approval_var = tk.BooleanVar(value=False)
+        self.include_approval_chk = ctk.CTkCheckBox(
+            approval_row,
+            text="Include this part on the ALTS approval sheet",
+            variable=self.include_approval_var,
+            command=self._on_toggle_approval_export,
+        )
+        self.include_approval_chk.pack(anchor="w")
 
         btn_row = ctk.CTkFrame(parent, fg_color="transparent")
         btn_row.pack(pady=(0, 14))
@@ -291,6 +315,16 @@ class DecisionWorkspaceCTK:
             hover_color="#991B1B",
         )
         self.auto_reject_btn.pack(side="left")
+
+        self.load_fake_external_btn = ctk.CTkButton(
+            btn_row,
+            text="Load Fake External Alts",
+            command=self._load_fake_external_alts,
+            width=190,
+            fg_color="#1D4ED8",
+            hover_color="#1E40AF",
+        )
+        self.load_fake_external_btn.pack(side="left", padx=(8, 0))
 
     def _build_bottom_panes(self, parent: ctk.CTkFrame):
         parent.grid_rowconfigure(0, weight=1)
@@ -497,6 +531,12 @@ class DecisionWorkspaceCTK:
             self._suspend_bom_section_event = False
     
         locked = bool(getattr(node, "locked", False))
+
+        try:
+            self._suspend_approval_toggle = True
+            self.include_approval_var.set(bool(getattr(node, "needs_approval", False)))
+        finally:
+            self._suspend_approval_toggle = False
     
         # PN stays gated by reject-all (original behavior)
         pn_unlock = (not locked) and all_rejected
@@ -514,6 +554,8 @@ class DecisionWorkspaceCTK:
             self.apply_pn_btn.configure(state=("normal" if pn_unlock else "disabled"))
     
             self.desc_entry.configure(state=("normal" if desc_unlock else "disabled"))
+            self.include_approval_chk.configure(state=("disabled" if locked else "normal"))
+            self.load_fake_external_btn.configure(state=("disabled" if locked else "normal"))
         except Exception:
             pass
 
@@ -559,41 +601,64 @@ class DecisionWorkspaceCTK:
 
         self._render_specs_for_alt(node, pick)
 
+
+    def _card_layout_metrics(self):
+        try:
+            panel_width = max(720, int(self.cards_host.winfo_width() or 720))
+        except Exception:
+            panel_width = 720
+
+        if panel_width < 950:
+            cols = 1
+        elif panel_width < 1450:
+            cols = 2
+        else:
+            cols = 3
+
+        usable_width = max(420, panel_width - 36)
+        gap_total = (cols - 1) * 12
+        col_width = max(290, min(360, (usable_width - gap_total) // cols))
+        wrap_width = max(210, col_width - 26)
+
+        return cols, col_width, wrap_width
+
     def _build_card_section(self, parent, title: str, alternates: list, node: DecisionNode):
         section = ctk.CTkFrame(parent, corner_radius=10, fg_color="#111827")
         section.pack(fill="x", padx=4, pady=6)
 
-        ctk.CTkLabel(section, text=title, font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=self.COLORS["text"]).pack(anchor="w", padx=10, pady=(8, 4))
+        ctk.CTkLabel(
+            section,
+            text=title,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=self.COLORS["text"]
+        ).pack(anchor="w", padx=10, pady=(8, 4))
 
         if not alternates:
-            ctk.CTkLabel(section, text="None", text_color=self.COLORS["text_dim"]).pack(anchor="w", padx=12, pady=(0, 8))
+            ctk.CTkLabel(
+                section,
+                text="None",
+                text_color=self.COLORS["text_dim"]
+            ).pack(anchor="w", padx=12, pady=(0, 8))
             return
 
-        # Masonry-style columns (instead of a row/column grid) to avoid row-height whitespace.
-        # In a normal grid, one tall card forces extra empty space in the neighboring card.
         holder = ctk.CTkFrame(section, fg_color="transparent")
-        holder.pack(fill="x", padx=8, pady=(0, 8))
+        holder.pack(fill="x", padx=8, pady=(0, 8), anchor="w")
+        holder.grid_anchor("nw")
 
-        cols = 2
-        try:
-            width = max(600, int(self.cards_host.winfo_width() or 600))
-            cols = 1 if width < 900 else 2
-        except Exception:
-            cols = 2
+        cols, card_width, _wrap_width = self._card_layout_metrics()
+        used_cols = max(1, min(cols, len(alternates)))
 
-        col_frames = []
-        for c in range(cols):
-            cf = ctk.CTkFrame(holder, fg_color="transparent")
-            cf.pack(side="left", fill="x", expand=True)
-            col_frames.append(cf)
+        for c in range(used_cols):
+            holder.grid_columnconfigure(c, weight=0, minsize=card_width)
 
         for i, alt in enumerate(alternates):
-            target = col_frames[i % cols]
-            card = self._create_card(node, alt)
-            card.pack(in_=target, fill="x", padx=6, pady=6, anchor="n")
+            r = i // used_cols
+            c = i % used_cols
+            card = self._create_card(holder, node, alt, card_width=card_width)
+            card.grid(row=r, column=c, padx=6, pady=6, sticky="nw")
 
-    def _create_card(self, node: DecisionNode, alt: Alternate):
+
+    def _create_card(self, parent, node: DecisionNode, alt: Alternate, card_width: int | None = None):
         is_rejected = bool(getattr(alt, "rejected", False))
         is_selected = bool(getattr(alt, "selected", False))
         is_pinned = (self._pinned_alt_id == getattr(alt, "id", None))
@@ -606,20 +671,26 @@ class DecisionWorkspaceCTK:
         elif is_pinned:
             border = self.COLORS["primary"]
 
-        outer = ctk.CTkFrame(self.cards_scroll, corner_radius=12, fg_color=border, height=1)
-        try:
-            outer.pack_propagate(True)
-        except Exception:
-            pass
-        inner = ctk.CTkFrame(outer, corner_radius=10, fg_color=self.COLORS["card_bg"], height=1)
-        try:
-            inner.pack_propagate(True)
-        except Exception:
-            pass
-        inner.pack(fill="x", expand=False, padx=1, pady=1)
+        _cols, _default_card_width, wrap_width = self._card_layout_metrics()
+        if card_width is None:
+            card_width = _default_card_width
 
-        head = ctk.CTkFrame(inner, fg_color="transparent")
-        head.pack(fill="x", padx=10, pady=(8, 4))
+        outer = ctk.CTkFrame(
+            parent,
+            corner_radius=12,
+            fg_color=border,
+            width=card_width,
+            height=250
+        )
+        outer.grid_propagate(False)
+        outer.pack_propagate(False)
+
+        inner = ctk.CTkFrame(
+            outer,
+            corner_radius=10,
+            fg_color=self.COLORS["card_bg"]
+        )
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
 
         is_inventory = (getattr(alt, "source", "") == "inventory")
         company_pn = (getattr(alt, "internal_part_number", "") or "").strip()
@@ -628,88 +699,194 @@ class DecisionWorkspaceCTK:
 
         rep_vendoritem = str(((getattr(alt, 'meta', {}) or {}).get('company_pn_rep_vendoritem', '') or '')).strip()
         matched_ui = (getattr(alt, '_matched_mpn_ui', '') or '').strip()
+
         title = company_pn if is_inventory else (mfg_pn or company_pn or "(no part number)")
         subtitle = (matched_ui or rep_vendoritem or mfg_pn) if is_inventory else mfg_name
 
+        head = ctk.CTkFrame(inner, fg_color="transparent")
+        head.pack(fill="x", padx=10, pady=(8, 4))
+
         left = ctk.CTkFrame(head, fg_color="transparent")
         left.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(left, text=title or "—", anchor="w", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w")
+
+        ctk.CTkLabel(
+            left,
+            text=title or "—",
+            anchor="w",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(anchor="w")
+
         if subtitle:
-            ctk.CTkLabel(left, text=subtitle, anchor="w", text_color=self.COLORS["text_dim"]).pack(anchor="w")
+            ctk.CTkLabel(
+                left,
+                text=subtitle,
+                anchor="w",
+                text_color=self.COLORS["text_dim"]
+            ).pack(anchor="w")
+
         try:
             alt_count = int(((getattr(alt, 'meta', {}) or {}).get('company_pn_mfgpn_count', 0) or 0))
         except Exception:
             alt_count = 0
+
         if is_inventory and alt_count >= 1:
-            ctk.CTkLabel(left, text=f"MFGPNs: {alt_count}", text_color=self.COLORS['text_dim']).pack(anchor='w')
+            ctk.CTkLabel(
+                left,
+                text=f"MFGPNs: {alt_count}",
+                text_color=self.COLORS["text_dim"]
+            ).pack(anchor="w")
 
         conf = float(getattr(alt, "confidence", 0.0) or 0.0)
         if (getattr(alt, "source", "") != "inventory") and conf == 0.0 and not is_rejected:
             conf = 1.0
-        ctk.CTkLabel(head, text=f"{int(conf*100)}%", width=56, corner_radius=8,
-                     fg_color="#1E3A8A", text_color="white").pack(side="right")
+
+        ctk.CTkLabel(
+            head,
+            text=f"{int(conf * 100)}%",
+            width=54,
+            corner_radius=8,
+            fg_color="#1E3A8A",
+            text_color="white"
+        ).pack(side="right", padx=(8, 0))
 
         desc = (getattr(alt, "description", "") or "").strip() or "(no description)"
-        # Keep card heights compact/smoother by clamping very long descriptions on the card.
-        if len(desc) > 180:
-            desc = desc[:177].rstrip() + "..."
-        ctk.CTkLabel(inner, text=desc, wraplength=520, justify="left",
-                     text_color=self.COLORS["text_dim"]).pack(anchor="w", padx=10, pady=(0, 6))
+        if len(desc) > 92:
+            desc = desc[:89].rstrip() + "..."
+
+        ctk.CTkLabel(
+            inner,
+            text=desc,
+            wraplength=wrap_width,
+            justify="left",
+            text_color=self.COLORS["text_dim"]
+        ).pack(anchor="w", padx=10, pady=(0, 6))
 
         stock = self._display_stock_for_alt(alt)
-        ctk.CTkLabel(inner, text=f"Source: {getattr(alt, 'source', '') or '-'}    Stock: {stock}",
-                     text_color=self.COLORS["text_dim"]).pack(anchor="w", padx=10, pady=(0, 2))
+        ctk.CTkLabel(
+            inner,
+            text=f"Source: {getattr(alt, 'source', '') or '-'}    Stock: {stock}",
+            text_color=self.COLORS["text_dim"]
+        ).pack(anchor="w", padx=10, pady=(0, 4))
 
-        badge_row = ctk.CTkFrame(inner, fg_color="transparent")
+        badge_row = ctk.CTkFrame(inner, fg_color="transparent", height=24)
         badge_row.pack(fill="x", padx=10, pady=(0, 4))
+        badge_row.pack_propagate(False)
+
         if is_selected:
-            ctk.CTkLabel(badge_row, text="LOCKED IN", fg_color="#14532D", corner_radius=6, padx=8, text_color="white").pack(side="left")
+            ctk.CTkLabel(
+                badge_row,
+                text="LOCKED IN",
+                fg_color="#14532D",
+                corner_radius=6,
+                padx=8,
+                text_color="white"
+            ).pack(side="left")
         elif is_rejected:
-            ctk.CTkLabel(badge_row, text="REJECTED", fg_color="#7F1D1D", corner_radius=6, padx=8, text_color="white").pack(side="left")
+            ctk.CTkLabel(
+                badge_row,
+                text="REJECTED",
+                fg_color="#7F1D1D",
+                corner_radius=6,
+                padx=8,
+                text_color="white"
+            ).pack(side="left")
         elif is_pinned:
-            ctk.CTkLabel(badge_row, text="VIEWING", fg_color="#1E3A8A", corner_radius=6, padx=8, text_color="white").pack(side="left")
+            ctk.CTkLabel(
+                badge_row,
+                text="VIEWING",
+                fg_color="#1E3A8A",
+                corner_radius=6,
+                padx=8,
+                text_color="white"
+            ).pack(side="left")
 
-        row = ctk.CTkFrame(inner, fg_color="transparent")
-        row.pack(fill="x", padx=10, pady=(0, 10))
+        actions = ctk.CTkFrame(inner, fg_color="transparent")
+        actions.pack(side="bottom", fill="x", padx=10, pady=(2, 10))
 
-        ctk.CTkButton(row, text="Copy", width=70, height=28,
-                      fg_color="#1F2937", hover_color="#374151",
-                      command=lambda a=alt: self._copy_to_clipboard(self._card_copy_text(a), toast="Copied card details")).pack(side="left")
+        left_actions = ctk.CTkFrame(actions, fg_color="transparent")
+        left_actions.pack(side="left", anchor="w")
+
+        right_actions = ctk.CTkFrame(actions, fg_color="transparent")
+        right_actions.pack(side="right", anchor="e")
+
+        ctk.CTkButton(
+            left_actions,
+            text="Copy",
+            width=64,
+            height=26,
+            fg_color="#1F2937",
+            hover_color="#374151",
+            command=lambda a=alt: self._copy_to_clipboard(self._card_copy_text(a), toast="Copied card details")
+        ).pack(side="left")
 
         if not getattr(node, "locked", False):
             if is_rejected:
-                ctk.CTkButton(row, text="Unreject", width=88, height=28,
-                              fg_color="#374151", hover_color="#4B5563",
-                              command=lambda a=alt: self._unreject_alt(node, a)).pack(side="right")
+                ctk.CTkButton(
+                    right_actions,
+                    text="Unreject",
+                    width=82,
+                    height=26,
+                    fg_color="#374151",
+                    hover_color="#4B5563",
+                    command=lambda a=alt: self._unreject_alt(node, a)
+                ).pack(side="right")
             elif is_selected:
-                ctk.CTkButton(row, text="Unlock", width=78, height=28,
-                              fg_color="#14532D", hover_color="#166534",
-                              command=lambda a=alt: self._add_alt(node, a)).pack(side="right")
-                ctk.CTkButton(row, text="Reject", width=78, height=28,
-                              fg_color="#374151", hover_color="#4B5563",
-                              command=lambda a=alt: self._reject_alt(node, a)).pack(side="right", padx=(0,6))
+                ctk.CTkButton(
+                    right_actions,
+                    text="Reject",
+                    width=72,
+                    height=26,
+                    fg_color="#374151",
+                    hover_color="#4B5563",
+                    command=lambda a=alt: self._reject_alt(node, a)
+                ).pack(side="right", padx=(0, 6))
+
+                ctk.CTkButton(
+                    right_actions,
+                    text="Unlock",
+                    width=72,
+                    height=26,
+                    fg_color="#14532D",
+                    hover_color="#166534",
+                    command=lambda a=alt: self._add_alt(node, a)
+                ).pack(side="right")
             else:
-                ctk.CTkButton(row, text="Reject", width=78, height=28,
-                              fg_color="#374151", hover_color="#4B5563",
-                              command=lambda a=alt: self._reject_alt(node, a)).pack(side="right", padx=(6, 0))
-                ctk.CTkButton(row, text="Add", width=70, height=28,
-                              fg_color=self.COLORS["success"], hover_color="#16A34A",
-                              command=lambda a=alt: self._add_alt(node, a)).pack(side="right")
+                ctk.CTkButton(
+                    right_actions,
+                    text="Reject",
+                    width=72,
+                    height=26,
+                    fg_color="#374151",
+                    hover_color="#4B5563",
+                    command=lambda a=alt: self._reject_alt(node, a)
+                ).pack(side="right", padx=(0, 6))
+
+                ctk.CTkButton(
+                    right_actions,
+                    text="Add",
+                    width=64,
+                    height=26,
+                    fg_color=self.COLORS["success"],
+                    hover_color="#16A34A",
+                    command=lambda a=alt: self._add_alt(node, a)
+                ).pack(side="right")
 
         def _bind_recursive(widget):
             try:
-                # Do NOT bind focus-click onto the action row (buttons) or buttons themselves.
-                if (widget is not row) and (not isinstance(widget, ctk.CTkButton)):
+                if widget is not actions and not isinstance(widget, ctk.CTkButton):
                     widget.bind("<Button-1>", lambda _e=None, a=alt: self._pin_card(node, a))
             except Exception:
                 pass
-            # Skip the action-row subtree entirely so button clicks never pin/focus the card.
-            if widget is row:
+
+            if widget is actions:
                 return
+
             for ch in getattr(widget, "winfo_children", lambda: [])():
                 _bind_recursive(ch)
+
         _bind_recursive(inner)
         return outer
+
 
     def _pin_card(self, node: DecisionNode, alt: Alternate):
         # card click = focus/view this card (persistent highlight until another card is clicked)
@@ -948,11 +1125,54 @@ class DecisionWorkspaceCTK:
         self._set_tree_selection_silent(node_id)
         return fresh
 
+    def _load_fake_external_alts(self):
+        if not self.current_node_id:
+            messagebox.showwarning("No Selection", "Select a BOM line first.")
+            return
+        try:
+            created = self.controller.seed_fake_external_alternates(self.current_node_id)
+            fresh = self.controller.get_node(self.current_node_id)
+            self._render_header_state(fresh)
+            self._render_cards(fresh)
+            self._render_specs_for_node(fresh)
+            self.refresh_node_table()
+            if created:
+                self.status_var.set(f"Loaded {len(created)} fake external alternates for testing.")
+            else:
+                self.status_var.set("Fake external alternates already loaded for this node.")
+        except Exception as e:
+            messagebox.showerror("Load Fake External Alternates Failed", str(e))
+
+    def _on_toggle_approval_export(self):
+        if getattr(self, "_suspend_approval_toggle", False):
+            return
+        if not self.current_node_id:
+            return
+        try:
+            self.controller.set_node_approval_export(self.current_node_id, bool(self.include_approval_var.get()))
+            fresh = self.controller.get_node(self.current_node_id)
+            self._render_header_state(fresh)
+        except Exception as e:
+            messagebox.showerror("Approval Flag Failed", str(e))
+
     def _add_alt(self, node: DecisionNode, alt: Alternate):
         try:
             if getattr(alt, 'selected', False):
                 self.controller.unselect_alternate(node.id, alt.id)
             else:
+                is_external = (getattr(alt, 'source', '') or '').lower() != 'inventory'
+                if is_external:
+                    try:
+                        umbrella_count = int(self.controller.get_internal_umbrella_count(node.id) or 0)
+                    except Exception:
+                        umbrella_count = 0
+                    if umbrella_count >= 3:
+                        ok = messagebox.askyesno(
+                            "External Alternate Confirmation",
+                            "The selected internal company part already has 3 or more internal manufacturer part numbers under it. Include additional external parts in the NPR anyway?"
+                        )
+                        if not ok:
+                            return
                 self.controller.select_alternate(node.id, alt.id)
             self._pinned_alt_id = alt.id
             self._refresh_after_alt_action(node.id, focus_alt_id=alt.id, refresh_table=True)
@@ -975,33 +1195,156 @@ class DecisionWorkspaceCTK:
         except Exception as e:
             messagebox.showerror("Unreject Alternate Failed", str(e))
     # ---------------------------------------------------------------------
+    # Loading/progress popup helpers
+    # ---------------------------------------------------------------------
+    def _show_loading_popup(self, title: str, phase: str = "Working..."):
+        self._close_loading_popup()
+        self._loading_started_at = time.time()
+        win = ctk.CTkToplevel(self.root)
+        win.title(title)
+        win.geometry("460x150")
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+
+        self._loading_phase_var = tk.StringVar(value=phase)
+        self._loading_detail_var = tk.StringVar(value="Starting...")
+
+        frame = ctk.CTkFrame(win, corner_radius=12)
+        frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+        ctk.CTkLabel(frame, textvariable=self._loading_phase_var, font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", pady=(4, 8), padx=10)
+        self._loading_bar = ctk.CTkProgressBar(frame)
+        self._loading_bar.pack(fill="x", padx=10, pady=(0, 8))
+        self._loading_bar.set(0.0)
+        ctk.CTkLabel(frame, textvariable=self._loading_detail_var, text_color=self.COLORS["text_dim"]).pack(anchor="w", padx=10)
+
+        self._loading_win = win
+        try:
+            win.update_idletasks()
+            x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - 230
+            y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - 75
+            win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+    def _close_loading_popup(self):
+        try:
+            if self._loading_win is not None and self._loading_win.winfo_exists():
+                self._loading_win.grab_release()
+                self._loading_win.destroy()
+        except Exception:
+            pass
+        self._loading_win = None
+        self._loading_bar = None
+        self._loading_phase_var = None
+        self._loading_detail_var = None
+
+    def _loading_phase_callback(self, message: str, determinate: bool = True):
+        def _apply():
+            if self._loading_phase_var is not None:
+                self._loading_phase_var.set(str(message or "Working..."))
+        try:
+            self.root.after(0, _apply)
+        except Exception:
+            _apply()
+
+    def _loading_progress_callback(self, *args):
+        def _apply(ratio: float, detail: str):
+            if self._loading_bar is not None:
+                try:
+                    self._loading_bar.set(max(0.0, min(1.0, float(ratio))))
+                except Exception:
+                    pass
+            if self._loading_detail_var is not None and detail:
+                self._loading_detail_var.set(detail)
+
+        ratio = 0.0
+        detail = ""
+        try:
+            if len(args) == 1:
+                ratio = float(args[0])
+                detail = f"{int(ratio * 100)}% complete"
+            elif len(args) >= 2:
+                cur = float(args[0] or 0)
+                total = float(args[1] or 1)
+                ratio = 0.0 if total <= 0 else cur / total
+                msg = str(args[2]) if len(args) >= 3 else "Working..."
+                detail = f"{msg} ({int(cur)}/{int(total)})"
+        except Exception:
+            ratio = 0.0
+            detail = "Working..."
+        try:
+            self.root.after(0, lambda: _apply(ratio, detail))
+        except Exception:
+            _apply(ratio, detail)
+
+    # ---------------------------------------------------------------------
     # Controller-backed actions (same names as legacy UI)
     # ---------------------------------------------------------------------
     def _load_inventory(self):
         path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
         if not path:
             return
-        try:
-            n = self.controller.load_inventory(path)
-            self.status_var.set(f"Loaded master inventory: {n} unique company parts.")
-            self.current_node_id = None
-            self.refresh_node_table()
-            self._render_empty_state()
-        except Exception as e:
-            messagebox.showerror("Load Master Inventory Failed", str(e))
+
+        self._show_loading_popup("Loading Master Inventory", "Reading workbook...")
+        self.status_var.set("Loading master inventory...")
+
+        def worker():
+            try:
+                n = self.controller.load_inventory(
+                    path,
+                    progress_cb=self._loading_progress_callback,
+                    phase_cb=self._loading_phase_callback,
+                )
+                self.root.after(0, lambda: self._on_inventory_loaded(n))
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): self._on_inventory_load_failed(err))
+
+        threading.Thread(target=worker, daemon=True, name="load-master-inventory").start()
+
+    def _on_inventory_loaded(self, n: int):
+        self._close_loading_popup()
+        self.status_var.set(f"Loaded master inventory: {n} unique company parts.")
+        self.current_node_id = None
+        self.refresh_node_table()
+        self._render_empty_state()
+
+    def _on_inventory_load_failed(self, err: str):
+        self._close_loading_popup()
+        messagebox.showerror("Load Master Inventory Failed", str(err))
 
     def _load_items_sheet(self):
         path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
         if not path:
             return
-        try:
-            n = self.controller.load_items_inventory(path)
-            self.status_var.set(f"Loaded ERP inventory: merged into {n} company parts.")
-            self.current_node_id = None
-            self.refresh_node_table()
-            self._render_empty_state()
-        except Exception as e:
-            messagebox.showerror("Load ERP Inventory Failed", str(e))
+
+        self._show_loading_popup("Loading ERP Inventory", "Reading workbook...")
+        self.status_var.set("Loading ERP inventory...")
+
+        def worker():
+            try:
+                n = self.controller.load_items_inventory(
+                    path,
+                    progress_cb=self._loading_progress_callback,
+                    phase_cb=self._loading_phase_callback,
+                )
+                self.root.after(0, lambda: self._on_items_inventory_loaded(n))
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): self._on_items_inventory_load_failed(err))
+
+        threading.Thread(target=worker, daemon=True, name="load-erp-inventory").start()
+
+    def _on_items_inventory_loaded(self, n: int):
+        self._close_loading_popup()
+        self.status_var.set(f"Loaded ERP inventory: merged into {n} company parts.")
+        self.current_node_id = None
+        self.refresh_node_table()
+        self._render_empty_state()
+
+    def _on_items_inventory_load_failed(self, err: str):
+        self._close_loading_popup()
+        messagebox.showerror("Load ERP Inventory Failed", str(err))
 
     def _load_bom(self):
         path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
@@ -1017,20 +1360,26 @@ class DecisionWorkspaceCTK:
             messagebox.showerror("Load BOM Failed", str(e))
 
     def _run_matching(self):
+        self._show_loading_popup("Running Matching", "Preparing semantic cache...")
         def worker():
             try:
                 n = self.controller.run_matching()
                 self.root.after(0, lambda: self._on_match_done(n))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Run Matching Failed", str(e)))
+                self.root.after(0, lambda err=str(e): self._on_match_failed(err))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_match_done(self, n: int):
+        self._close_loading_popup()
         self.refresh_node_table()
         self.current_node_id = None
         self._render_empty_state()
         self.status_var.set(f"Matching complete. Built {n} decision nodes.")
+
+    def _on_match_failed(self, err: str):
+        self._close_loading_popup()
+        messagebox.showerror("Run Matching Failed", str(err))
 
     def _open_workspace(self):
         try:

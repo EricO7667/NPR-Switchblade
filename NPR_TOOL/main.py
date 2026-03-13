@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 
 from .NEW_decision_controller import DecisionController, ControllerConfig
-from .ui import DecisionWorkspaceUI
 from .NEW_UI import DecisionWorkspaceCTK
 import customtkinter as ctk
 import tkinter as tk

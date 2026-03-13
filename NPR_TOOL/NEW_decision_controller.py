@@ -263,16 +263,30 @@ class DecisionController:
             # Fallback for older repo versions
             self.inv_company_repo.upsert_company_parts(wsid, company_rows)
 
-    def load_inventory(self, xlsx_path: str) -> int:
+
+# OLD LOGIC need to incorpate the data loader instead. data loader was created after this logic, change usage to that
+    def load_inventory(
+        self,
+        xlsx_path: str,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+        phase_cb: Optional[Callable[[str], None]] = None,
+    ) -> int:
         """Load **master inventory** (CPN-level + alternates) and stage it for DB persistence.
 
         - Builds inventory_company rows (CPN pooled stock + alternates JSON)
         - Builds a flat InventoryPart list for MatchingEngine compatibility
           (CRITICAL: ensure InventoryPart.substitutes includes ALL MPNs under the CPN)
         """
+        if phase_cb:
+            try:
+                phase_cb("Reading workbook and parsing descriptions...")
+            except Exception:
+                pass
+
         company_rows, flat_inventory = DataLoader.build_inventory_company_parts(
             xlsx_path,
             erp_inventory_path=None,
+            progress_cb=progress_cb,
         )
 
         # IMPORTANT: do not dedupe here; preserve alternates_json payload exactly as built by DataLoader.
@@ -286,6 +300,14 @@ class DecisionController:
         #   substitutes = all other MPNs under that CPN
         # This is what the UI bottom-right panel expects.
         # ---------------------------------------------------------
+        if phase_cb:
+            try:
+                phase_cb("Rebuilding inventory view...")
+                if progress_cb:
+                    progress_cb(0, 1, "Rebuilding inventory view")
+            except Exception:
+                pass
+
         rebuilt_flat = self._company_rows_to_flat_inventory(company_rows)
 
         self.inventory = rebuilt_flat
@@ -329,6 +351,13 @@ class DecisionController:
 
             merged_rows = list(merged_by_cpn.values())
             self._pending_inventory_company_rows = merged_rows
+            if phase_cb:
+                try:
+                    phase_cb("Syncing inventory database...")
+                    if progress_cb:
+                        progress_cb(0, 1, "Syncing inventory database")
+                except Exception:
+                    pass
             self._upsert_current_inventory_store(merged_rows, source_label="MASTER")
             if self.workspace_id:
                 self.ws_repo.update_meta(
@@ -339,13 +368,27 @@ class DecisionController:
         except Exception as e:
             print(f"[DB] current inventory store update failed: {e}")
 
-        # Treat master inventory as alternates DB too (MPN -> [base itemnum...]) if available
+        # Treat master inventory as alternates DB too (MPN -> [base itemnum]) using the
+        # already-built company_rows payload. Do NOT reread the master workbook here; that
+        # duplicates the heaviest load/parsing path on the UI thread and can freeze the UI.
         try:
-            _, _, mpn_to_base = DataLoader.load_master_inventory(xlsx_path)
-            self._alt_mpn_to_base = mpn_to_base or {}
+            if phase_cb:
+                try:
+                    phase_cb("Building alternate lookup map...")
+                    if progress_cb:
+                        progress_cb(0, 1, "Building alternate lookup map")
+                except Exception:
+                    pass
+            self._alt_mpn_to_base = self._build_mpn_to_base_from_company_rows(company_rows)
             self._alt_loaded = True
         except Exception:
             pass
+
+        if progress_cb:
+            try:
+                progress_cb(1, 1, "Done")
+            except Exception:
+                pass
 
         return len(self.inventory)
 
@@ -358,6 +401,45 @@ class DecisionController:
         should be preserved exactly as produced by DataLoader, then persisted.
         """
         return list(rows or [])
+
+    def _build_mpn_to_base_from_company_rows(self, company_rows: list[dict]) -> dict[str, list[str]]:
+        """Build normalized MPN -> [company/base itemnum] from inventory_company rows.
+
+        This replaces the previous controller behavior of calling
+        DataLoader.load_master_inventory(xlsx_path) a second time after the master had already
+        been loaded into company_rows. Re-reading the workbook here doubled the synchronous
+        work on the UI thread and caused freezes/regressions on large master files.
+        """
+        out: dict[str, list[str]] = {}
+        norm = getattr(DataLoader, 'norm_mpn_key', None)
+        if not callable(norm):
+            return out
+
+        for row in (company_rows or []):
+            if not isinstance(row, dict):
+                continue
+            base = str(row.get('cpn', '')).strip()
+            if not base:
+                continue
+
+            alts = row.get('alternates_json') or row.get('alternates') or []
+            if isinstance(alts, str):
+                try:
+                    alts = json.loads(alts)
+                except Exception:
+                    alts = []
+
+            for alt in (alts or []):
+                if not isinstance(alt, dict):
+                    continue
+                mpn = str(alt.get('mpn', '') or alt.get('mfgpn', '') or alt.get('manufacturer_part_number', '')).strip()
+                key = norm(mpn)
+                if not key:
+                    continue
+                out.setdefault(key, [])
+                if base not in out[key]:
+                    out[key].append(base)
+        return out
 
     def _company_rows_to_flat_inventory(self, company_rows: list[dict]) -> list[InventoryPart]:
         """
@@ -385,89 +467,78 @@ class DecisionController:
     def _company_row_to_inventory_part(self, row: dict) -> Optional[InventoryPart]:
         """
         Build a synthetic InventoryPart from an inventory_company row.
-    
-        inventory_company row shape (authoritative):
-          {
-            "cpn": str,
-            "canonical_desc": str,
-            "stock_total": int,
-            "alternates_json": [
-                { "mpn": "...", "mfgname": "...", "mfgid": "..." },
-                ...
-            ]
-          }
-    
-        Output InventoryPart:
-          - itemnum     = CPN
-          - vendoritem  = representative MFGPN
-          - substitutes = ALL other MFGPNs under that CPN
+
+        IMPORTANT:
+        - Do not re-run description parsing here.
+        - The loader is responsible for parsing once and attaching row["parsed"].
+        - Re-parsing during rebuild caused the post-progress-bar hang/crash.
         """
-    
+
         if not isinstance(row, dict):
             return None
-    
+
         cpn = str(row.get("cpn", "")).strip()
         if not cpn:
             return None
-    
+
         desc = str(row.get("canonical_desc", "")).strip()
         stock_total = int(row.get("stock_total", 0) or 0)
-    
+
+        parsed_raw = row.get("parsed")
+        parsed = dict(parsed_raw) if isinstance(parsed_raw, dict) else {}
+
         alts = row.get("alternates_json") or row.get("alternates") or []
+        if isinstance(alts, str):
+            try:
+                alts = json.loads(alts)
+            except Exception:
+                alts = []
         if not isinstance(alts, list):
             alts = []
-    
-        # Extract MFGPNs in stable order
+
         mpns: list[str] = []
         mfgname = ""
         mfgid = ""
-    
+
         for a in alts:
             if not isinstance(a, dict):
                 continue
-            
+
             mpn = str(
                 a.get("mpn")
                 or a.get("mfgpn")
                 or a.get("vendoritem")
                 or ""
             ).strip()
-    
             if not mpn:
                 continue
-            
+
             if not mfgname:
-                mfgname = str(a.get("mfgname", "")).strip()
+                mfgname = str(a.get("mfgname", "") or "").strip()
             if not mfgid:
-                mfgid = str(a.get("mfgid", "")).strip()
-    
-            mpns.append(mpn)
-    
-        if not mpns:
-            # CPN with no known MFGPNs still gets an InventoryPart
-            rep_mpn = ""
-            subs: list[str] = []
-        else:
-            rep_mpn = mpns[0]
-            subs = [m for m in mpns[1:] if m != rep_mpn]
-    
+                mfgid = str(a.get("mfgid", "") or "").strip()
+
+            if mpn not in mpns:
+                mpns.append(mpn)
+
+        rep_mpn = mpns[0] if mpns else ""
+        subs = mpns[1:] if len(mpns) > 1 else []
+
         inv = InventoryPart(
             itemnum=cpn,
             desc=desc,
             mfgid=mfgid,
             mfgname=mfgname,
             vendoritem=rep_mpn,
-            substitutes=subs,          # ← STRINGS, not objects
+            substitutes=subs,
             raw_fields={
                 "totalqty": stock_total,
             },
-            parsed={},
+            parsed=parsed,
             api_data=None,
         )
-    
-        # Optional: debug / inspection hook
+
         inv._all_mpns = list(mpns)
-    
         return inv
     
 
@@ -493,12 +564,23 @@ class DecisionController:
         num_with_subs = sum(1 for _, subs in (subs_by_base or {}).items() if subs)
         return num_with_subs, len(self._alt_mpn_to_base)
 
-    def load_items_inventory(self, xlsx_path: str) -> int:
+    def load_items_inventory(
+        self,
+        xlsx_path: str,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+        phase_cb: Optional[Callable[[str], None]] = None,
+    ) -> int:
         """Load the ERP inventory extract and attach stock totals at the CPN level.
 
         In the v2 model, stock is ONLY stored on the company part number record (inventory_company).
         """
         self._pending_inventory_erp_path = xlsx_path
+
+        if phase_cb:
+            try:
+                phase_cb("Reading ERP workbook...")
+            except Exception:
+                pass
 
         try:
             stock_totals = DataLoader.load_erp_stock_totals(xlsx_path)
@@ -537,7 +619,14 @@ class DecisionController:
             for cpn_key, qty in erp_only[:5]:
                 print(f"[DB][DEBUG] ERP-only sample: cpn={cpn_key!r} qty={qty}")
 
-        for cpn, qty in stock_totals.items():
+        total_stock_rows = max(1, len(stock_totals))
+        if phase_cb:
+            try:
+                phase_cb("Merging ERP stock totals...")
+            except Exception:
+                pass
+
+        for idx, (cpn, qty) in enumerate(stock_totals.items(), start=1):
             cpn_key = str(cpn or "").strip()
             if not cpn_key:
                 continue
@@ -552,6 +641,11 @@ class DecisionController:
                 by_cpn[cpn_key] = row
             row["stock_total"] = int(qty or 0)
             merged += 1
+            if progress_cb and (idx % 250 == 0 or idx == total_stock_rows):
+                try:
+                    progress_cb(idx, total_stock_rows, f"Merging ERP stock totals {idx}/{total_stock_rows}")
+                except Exception:
+                    pass
 
         self._pending_inventory_company_rows = list(by_cpn.values())
 
@@ -559,6 +653,13 @@ class DecisionController:
         # Refresh the live in-memory inventory snapshot too.
         # Otherwise UI cards keep using stale InventoryPart.raw_fields["totalqty"].
         try:
+            if phase_cb:
+                try:
+                    phase_cb("Rebuilding inventory view...")
+                    if progress_cb:
+                        progress_cb(0, 1, "Rebuilding inventory view")
+                except Exception:
+                    pass
             rebuilt_flat = self._company_rows_to_flat_inventory(self._pending_inventory_company_rows)
             self.inventory = rebuilt_flat
             self._inv_by_itemnum = {
@@ -573,11 +674,24 @@ class DecisionController:
 
         # Persist current inventory store immediately
         try:
+            if phase_cb:
+                try:
+                    phase_cb("Syncing inventory database...")
+                    if progress_cb:
+                        progress_cb(0, 1, "Syncing inventory database")
+                except Exception:
+                    pass
             self._upsert_current_inventory_store(self._pending_inventory_company_rows, source_label="ERP")
             if self.workspace_id:
                 self.ws_repo.update_meta(self.workspace_id, inventory_erp_path=xlsx_path)
         except Exception as e:
             print(f"[DB] current inventory store update (ERP) failed: {e}")
+
+        if progress_cb:
+            try:
+                progress_cb(1, 1, "Done")
+            except Exception:
+                pass
 
         return merged
 
@@ -935,10 +1049,11 @@ class DecisionController:
                 alternates=[],
 
                 status=status,
-                locked=False,
+                locked=bool(r.get("locked", 0) or 0),
 
                 notes=str(r.get("notes", "") or ""),
                 explain=dict(r.get("explain_json") or {}),
+                needs_approval=bool(r.get("needs_approval", 0) or 0),
                 
             )
             try:
@@ -1321,6 +1436,94 @@ class DecisionController:
         self._recompute_node_flags(node)
         self._persist_node_and_alts(node)
 
+
+    def set_node_approval_export(self, node_id: str, include_in_approval: bool) -> bool:
+        """User-controlled flag for whether this node should appear on the ALTS approval sheet."""
+        node = self.get_node(node_id)
+        self._ensure_unlocked(node)
+        node.needs_approval = bool(include_in_approval)
+        self._persist_node_and_alts(node)
+        return node.needs_approval
+
+    def _selected_external_alts(self, node: DecisionNode) -> List[Alternate]:
+        out: List[Alternate] = []
+        try:
+            for a in (node.selected_alternates() or []):
+                if bool(getattr(a, "rejected", False)):
+                    continue
+                if (getattr(a, "source", "") or "").lower() == "inventory":
+                    continue
+                out.append(a)
+        except Exception:
+            pass
+        return out
+
+    def get_internal_umbrella_count(self, node_id: str) -> int:
+        node = self.get_node(node_id)
+        inv_alt = self._selected_inventory_alt(node)
+        if inv_alt is None:
+            return 0
+        try:
+            meta = dict(getattr(inv_alt, "meta", {}) or {})
+            cnt = int(meta.get("company_pn_mfgpn_count", 0) or 0)
+            if cnt > 0:
+                return cnt
+        except Exception:
+            pass
+        members = self._inventory_family_members(inv_alt)
+        return len(members)
+
+    def _inventory_family_members(self, inv_alt: Alternate) -> List[Dict[str, str]]:
+        """Return all manufacturer part numbers grouped under the selected internal company part."""
+        members: List[Dict[str, str]] = []
+        seen = set()
+
+        def push(mpn: str, manufacturer: str = "", description: str = "", supplier: str = ""):
+            mpn = str(mpn or "").strip()
+            manufacturer = str(manufacturer or "").strip()
+            description = str(description or "").strip()
+            supplier = str(supplier or "").strip()
+            if not mpn:
+                return
+            key = (mpn.lower(), manufacturer.lower(), supplier.lower())
+            if key in seen:
+                return
+            seen.add(key)
+            members.append({
+                "manufacturer_part_number": mpn,
+                "manufacturer": manufacturer,
+                "description": description,
+                "supplier": supplier,
+            })
+
+        try:
+            raw = getattr(inv_alt, "raw", None)
+            if raw is not None:
+                push(
+                    getattr(raw, "vendoritem", "") or getattr(raw, "mfgpn", "") or "",
+                    getattr(raw, "mfgname", "") or "",
+                    getattr(raw, "desc", "") or getattr(raw, "description", "") or getattr(inv_alt, "description", "") or "",
+                    getattr(raw, "supplier", "") or "",
+                )
+                for s in (getattr(raw, "substitutes", None) or []):
+                    push(
+                        getattr(s, "mfgpn", "") or getattr(s, "manufacturer_part_number", "") or "",
+                        getattr(s, "mfgname", "") or getattr(s, "manufacturer", "") or getattr(raw, "mfgname", "") or "",
+                        getattr(s, "description", "") or getattr(inv_alt, "description", "") or "",
+                        getattr(s, "supplier", "") or getattr(raw, "supplier", "") or "",
+                    )
+                for mpn in (getattr(raw, "_ui_group_mpns", None) or []):
+                    push(mpn, getattr(raw, "mfgname", "") or "", getattr(raw, "desc", "") or getattr(inv_alt, "description", "") or "", getattr(raw, "supplier", "") or "")
+        except Exception:
+            pass
+
+        push(
+            getattr(inv_alt, "manufacturer_part_number", "") or "",
+            getattr(inv_alt, "manufacturer", "") or "",
+            getattr(inv_alt, "description", "") or "",
+            getattr(inv_alt, "supplier", "") or "",
+        )
+        return members
 
     def _selected_inventory_alt(self, node: DecisionNode) -> Optional[Alternate]:
         """Return the active inventory card for the node's anchored CPN (even if not explicitly selected)."""
@@ -2753,6 +2956,94 @@ class DecisionController:
         self._persist_node_and_alts(node)
 
 
+    def seed_fake_external_alternates(self, node_id: str) -> List[Alternate]:
+        """Seed deterministic fake external alternates for UI/export testing before API integration exists."""
+        node = self.get_node(node_id)
+        self._ensure_unlocked(node)
+
+        existing_keys = {
+            (str(getattr(a, "source", "") or "").strip().lower(),
+             str(getattr(a, "manufacturer_part_number", "") or "").strip().lower())
+            for a in (node.alternates or [])
+        }
+
+        description = str(getattr(node, "description", "") or "").strip() or "Stub external alternate"
+        base_mpn = str(getattr(node, "manufacturer_part_number", "") or "").strip()
+
+        fake_rows = [
+            {
+                "source": "external_stub",
+                "manufacturer": "Murata",
+                "manufacturer_part_number": (f"{base_mpn}-EXT1" if base_mpn else "GRM188R71C104KA01D"),
+                "description": description,
+                "confidence": 0.82,
+                "relationship": "External Alternate",
+                "supplier": "DigiKey",
+                "unit_cost": 0.021,
+                "stock": 125000,
+            },
+            {
+                "source": "external_stub",
+                "manufacturer": "TDK",
+                "manufacturer_part_number": (f"{base_mpn}-EXT2" if base_mpn else "C1608X7R1C104K080AA"),
+                "description": description,
+                "confidence": 0.76,
+                "relationship": "External Alternate",
+                "supplier": "Mouser",
+                "unit_cost": 0.024,
+                "stock": 88000,
+            },
+            {
+                "source": "external_stub",
+                "manufacturer": "Yageo",
+                "manufacturer_part_number": (f"{base_mpn}-EXT3" if base_mpn else "CC0603KRX7R9BB104"),
+                "description": description,
+                "confidence": 0.68,
+                "relationship": "External Alternate",
+                "supplier": "Arrow",
+                "unit_cost": 0.018,
+                "stock": 56000,
+            },
+        ]
+
+        created: List[Alternate] = []
+        for row in fake_rows:
+            key = (row["source"].strip().lower(), row["manufacturer_part_number"].strip().lower())
+            if key in existing_keys:
+                continue
+
+            alt = Alternate(
+                id=Alternate.new_id("EXT"),
+                source=row["source"],
+                manufacturer=row["manufacturer"],
+                manufacturer_part_number=row["manufacturer_part_number"],
+                internal_part_number="",
+                description=row["description"],
+                confidence=float(row["confidence"]),
+                relationship=row["relationship"],
+                selected=False,
+                rejected=False,
+                raw=dict(row),
+                meta={"stub": True, "seeded_for_testing": True},
+            )
+            # best-effort optional attrs used by the UI detail payload for non-inventory cards
+            try:
+                setattr(alt, "supplier", row["supplier"])
+                setattr(alt, "unit_cost", row["unit_cost"])
+                setattr(alt, "stock", row["stock"])
+            except Exception:
+                pass
+            node.alternates.append(alt)
+            created.append(alt)
+            existing_keys.add(key)
+
+        if created:
+            self.external_cache[node_id] = [a for a in (node.alternates or []) if (getattr(a, "source", "") or "") != "inventory"]
+            self._recompute_node_flags(node)
+            self._persist_node_and_alts(node)
+
+        return created
+
     def add_manual_alternate(self, node_id: str, manufacturer_part_number: str, description: str = "Manual alternate") -> Alternate:
         node = self.get_node(node_id)
         self._ensure_unlocked(node)
@@ -3007,21 +3298,9 @@ class DecisionController:
  #------------------------------------   # ----------------------------
     # NPR Workspace (from DecisionNodes)
     # ----------------------------
+
     def export_npr(self, output_path: str = None):
-            """Export a single Excel workbook containing BOM + NPR outputs in separate sheets.
-
-            Sheets:
-              - BOM (from BOM_TEMPLATE if available)
-              - NPR
-              - Alternates for Approval
-              - Bomexistences
-
-            Description export rules:
-              - Default is BLANK (input BOM description is not exported unless user overrides).
-              - If an inventory card is selected/anchored, export that card's description.
-              - If user applied an override, export the override.
-            """
-
+            """Export a single Excel workbook containing BOM + NPR outputs in separate sheets."""
             try:
                 self.flush_workspace_to_db()
             except Exception as e:
@@ -3035,6 +3314,9 @@ class DecisionController:
                 raise RuntimeError("No parts marked Ready for Export.")
 
             from openpyxl import Workbook
+            from copy import copy as _cpy
+            from openpyxl.utils.cell import range_boundaries, get_column_letter
+            from openpyxl.worksheet.table import Table
 
             bom_template_path = Path(self.cfg.bom_template_path)
             if bom_template_path.exists():
@@ -3052,12 +3334,79 @@ class DecisionController:
             else:
                 bom_ws = wb.create_sheet("BOM")
 
-            npr_ws = wb["NPR"] if "NPR" in wb.sheetnames else wb.create_sheet("NPR")
-            ws_alt = wb["Alternates for Approval"] if "Alternates for Approval" in wb.sheetnames else wb.create_sheet("Alternates for Approval")
-            ws_bomexist = wb["BOMNOTES"] if "BOMNOTES" in wb.sheetnames else wb.create_sheet("BOMNOTES")
-
             def _norm(v):
                 return str(v or "").strip().lower()
+
+            def _copy_sheet_template(src_ws, dst_ws):
+                for r in range(1, src_ws.max_row + 1):
+                    dst_ws.row_dimensions[r].height = src_ws.row_dimensions[r].height
+                    for c in range(1, src_ws.max_column + 1):
+                        s = src_ws.cell(row=r, column=c)
+                        d = dst_ws.cell(row=r, column=c, value=s.value)
+                        d._style = _cpy(s._style)
+                        d.number_format = s.number_format
+                        d.font = _cpy(s.font)
+                        d.fill = _cpy(s.fill)
+                        d.border = _cpy(s.border)
+                        d.alignment = _cpy(s.alignment)
+                        d.protection = _cpy(s.protection)
+                try:
+                    for col_letter, dim in src_ws.column_dimensions.items():
+                        dst_ws.column_dimensions[col_letter].width = dim.width
+                except Exception:
+                    pass
+                try:
+                    for merged in list(src_ws.merged_cells.ranges):
+                        dst_ws.merge_cells(str(merged))
+                except Exception:
+                    pass
+
+            def _copy_row_style(ws, src_row: int, dst_row: int):
+                ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
+                for c in range(1, ws.max_column + 1):
+                    s = ws.cell(row=src_row, column=c)
+                    d = ws.cell(row=dst_row, column=c)
+                    d._style = _cpy(s._style)
+                    d.number_format = s.number_format
+                    d.font = _cpy(s.font)
+                    d.fill = _cpy(s.fill)
+                    d.border = _cpy(s.border)
+                    d.alignment = _cpy(s.alignment)
+                    d.protection = _cpy(s.protection)
+
+            def _find_header_row(ws, expected_map: Dict[int, str], max_scan: int = 250) -> int:
+                for r in range(1, min(ws.max_row, max_scan) + 1):
+                    ok = True
+                    for col, expected in expected_map.items():
+                        val = str(ws.cell(row=r, column=col).value or "").strip().lower()
+                        if val != expected.strip().lower():
+                            ok = False
+                            break
+                    if ok:
+                        return r
+                return 0
+
+            def _find_table_by_header_row(ws, header_row: int):
+                try:
+                    for t in getattr(ws, "tables", {}).values():
+                        min_col, min_row, max_col, max_row = range_boundaries(t.ref)
+                        if min_row == header_row:
+                            return t
+                except Exception:
+                    pass
+                return None
+
+            def _shift_table_ref(t: Table, delta_rows: int, start_row_inclusive: int):
+                try:
+                    min_col, min_row, max_col, max_row = range_boundaries(t.ref)
+                    if min_row >= start_row_inclusive:
+                        min_row += delta_rows
+                        max_row += delta_rows
+                    elif max_row >= start_row_inclusive:
+                        max_row += delta_rows
+                    t.ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{max_row}"
+                except Exception:
+                    pass
 
             def find_bom_sections(ws):
                 sections = {}
@@ -3079,107 +3428,54 @@ class DecisionController:
                             sections[label or f"SECTION@{r}"] = r
                 return sections
 
-            sections = find_bom_sections(bom_ws)
-            # --- Template table expansion ---
-            # BOM_TEMPLATE uses multiple section tables with a fixed row footprint. Writing past the
-            # footprint can overwrite adjacent sections or make Excel report corruption. We prevent
-            # that by inserting rows inside the section and expanding the corresponding Table.ref.
-
-            from copy import copy as _copy_style
-            from openpyxl.utils.cell import range_boundaries, get_column_letter
-            from openpyxl.worksheet.table import Table
-
-            def _find_table_by_header_row(ws, header_row: int):
-                try:
-                    for t in getattr(ws, "tables", {}).values():
-                        min_col, min_row, max_col, max_row = range_boundaries(t.ref)
-                        if min_row == header_row:
-                            return t
-                except Exception:
-                    pass
-                return None
-
-            def _shift_table_ref(t: Table, delta_rows: int, start_row_inclusive: int):
-                # Shift a table's ref if rows are inserted at/above it.
-                try:
-                    min_col, min_row, max_col, max_row = range_boundaries(t.ref)
-                    if min_row >= start_row_inclusive:
-                        min_row += delta_rows
-                        max_row += delta_rows
-                    elif max_row >= start_row_inclusive:
-                        max_row += delta_rows
-                    t.ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{max_row}"
-                except Exception:
-                    pass
-
             def _ensure_section_capacity(ws, header_row: int, required_rows: int, next_header_row: int = None):
                 data_start = header_row + 1
-
-                # Next section header row implies a label row one row above it; insert before that label
                 if next_header_row:
                     insert_at = max(1, next_header_row - 1)
                     available = max(0, insert_at - data_start)
                 else:
                     insert_at = ws.max_row + 1
                     available = max(0, (ws.max_row + 1) - data_start)
-
                 if required_rows <= available:
                     return
-
                 need = required_rows - available
                 if need <= 0:
                     return
-
                 tables = list(getattr(ws, "tables", {}).values()) if getattr(ws, "tables", None) else []
                 ws.insert_rows(insert_at, amount=need)
-
-                # Shift all table refs below the insertion point
                 for t in tables:
                     _shift_table_ref(t, need, insert_at)
-
-                # Expand the section table itself (if present)
                 t = _find_table_by_header_row(ws, header_row)
                 if t is not None:
                     try:
                         min_col, min_row, max_col, max_row = range_boundaries(t.ref)
                         if next_header_row:
-                            new_max_row = next_header_row - 2  # last data row before next label row
+                            new_max_row = next_header_row - 2
                         else:
                             new_max_row = max_row + need
                         if new_max_row > max_row:
                             t.ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{new_max_row}"
                     except Exception:
                         pass
-
-                # Copy styling from the first existing data row (or header if no data row exists)
                 style_src_row = data_start if data_start <= ws.max_row else header_row
                 for rr in range(insert_at, insert_at + need):
-                    ws.row_dimensions[rr].height = ws.row_dimensions[style_src_row].height
+                    _copy_row_style(ws, style_src_row, rr)
                     for cc in range(1, ws.max_column + 1):
-                        src = ws.cell(row=style_src_row, column=cc)
-                        dst = ws.cell(row=rr, column=cc)
-                        dst._style = _copy_style(src._style)
-                        dst.number_format = src.number_format
-                        dst.font = _copy_style(src.font)
-                        dst.fill = _copy_style(src.fill)
-                        dst.border = _copy_style(src.border)
-                        dst.alignment = _copy_style(src.alignment)
-                        dst.protection = _copy_style(src.protection)
-                        dst.comment = None
+                        ws.cell(row=rr, column=cc).comment = None
 
-
+            sections = find_bom_sections(bom_ws)
             if not sections:
                 bom_ws.delete_rows(1, bom_ws.max_row)
                 bom_ws["A1"] = "BOM Export"
                 base_headers = ["Item", "ELAN Part Number", "Description", "QTY.", "REFDES", "TYPE", "Manufacturer", "Manufacturer PN", "Price", "EXT Price"]
-                start = 4
+                start_row = 4
                 for sec_name in ("SURFACE MOUNT", "THROUGH-HOLE", "AUXILIARY"):
-                    bom_ws.cell(row=start, column=2, value=sec_name)
-                    hdr = start + 1
+                    bom_ws.cell(row=start_row, column=2, value=sec_name)
+                    hdr = start_row + 1
                     for j, h in enumerate(base_headers, start=1):
                         bom_ws.cell(row=hdr, column=j, value=h)
                     sections[sec_name] = hdr
-                    start = hdr + 3
+                    start_row = hdr + 3
 
             def first_empty_row(ws, header_row):
                 r = header_row + 1
@@ -3210,108 +3506,86 @@ class DecisionController:
                 if s.startswith("THROUGH") or s.startswith("THRU"):
                     return "THROUGH-HOLE", "TH"
                 if s.startswith("AUXILIARY") or s.startswith("AUX"):
-                    if "ASSEMBLY" in s:
-                        return "AUXILIARY", "assembly"
-                    if "MECH" in s:
-                        return "AUXILIARY", "mech"
-                    if "PRODUCTION" in s:
-                        return "AUXILIARY", "production"
-                    if "OTHER" in s:
-                        return "AUXILIARY", "other"
-                    return "AUXILIARY", "aux"
+                    return "AUXILIARY", "AUX"
                 return "SURFACE MOUNT", "SMT"
 
-            def export_mfg_fields(node: DecisionNode) -> tuple[str, str]:
+            counts = Counter()
+            for _n in ready_nodes:
+                sec = self.get_node_bom_section(_n.id)
+                bucket, _type = section_bucket(sec)
+                counts[bucket] += 1
+
+            ordered_secs = sorted(sections.items(), key=lambda kv: kv[1])
+            for i, (sec_name, hdr_row) in enumerate(ordered_secs):
+                next_hdr = ordered_secs[i + 1][1] if i + 1 < len(ordered_secs) else None
+                req = counts.get(sec_name, 0)
+                _ensure_section_capacity(bom_ws, hdr_row, req, next_hdr)
+
+            def export_mfg_fields(node):
                 inv_alt = self._selected_inventory_alt(node)
                 if inv_alt is not None:
-                    return (str(getattr(inv_alt, "manufacturer", "") or "").strip(), str(getattr(inv_alt, "manufacturer_part_number", "") or "").strip())
+                    return (
+                        (getattr(inv_alt, "manufacturer", "") or "").strip(),
+                        (getattr(inv_alt, "manufacturer_part_number", "") or "").strip(),
+                    )
+                exts = self._selected_external_alts(node)
+                if exts:
+                    a = exts[0]
+                    return (
+                        (getattr(a, "manufacturer", "") or "").strip(),
+                        (getattr(a, "manufacturer_part_number", "") or "").strip(),
+                    )
+                return "", (getattr(node, "bom_mpn", "") or "").strip()
+
+            def _get_designator(node):
                 try:
-                    for a in (node.selected_alternates() or []):
-                        if (getattr(a, "source", "") or "").lower() == "inventory":
-                            continue
-                        if bool(getattr(a, "rejected", False)):
-                            continue
-                        return (str(getattr(a, "manufacturer", "") or "").strip(), str(getattr(a, "manufacturer_part_number", "") or "").strip())
+                    raw = getattr(node, "raw", None)
+                    if isinstance(raw, dict):
+                        return (raw.get("raw_fields") or {}).get("designator", "") or ""
                 except Exception:
                     pass
-                return ("", str(getattr(node, "bom_mpn", "") or "").strip())
-
-
-            # Ensure the BOM sections have enough rows for this export before we start writing.
-            try:
-                from collections import Counter as _Counter
-                counts = _Counter()
-                for _n in ready_nodes:
-                    _sec = self.get_node_bom_section(_n.id)
-                    _bucket, _t = section_bucket(_sec)
-                    counts[_bucket] += 1
-
-                sec_items = [(sec_name, int(hdr_row)) for sec_name, hdr_row in (sections or {}).items() if isinstance(hdr_row, int)]
-                sec_items.sort(key=lambda x: x[1])
-                hdr_rows_sorted = [r for _, r in sec_items]
-                next_by_hdr = {r: (hdr_rows_sorted[i + 1] if i + 1 < len(hdr_rows_sorted) else None) for i, r in enumerate(hdr_rows_sorted)}
-
-                for sec_name, hdr_row in sec_items:
-                    add_count = int(counts.get(sec_name, 0))
-                    if add_count <= 0:
-                        continue
-                    used = int(write_row_by_section.get(sec_name, hdr_row + 1)) - (hdr_row + 1)
-                    required = max(0, used) + add_count
-                    _ensure_section_capacity(bom_ws, hdr_row, required, next_header_row=next_by_hdr.get(hdr_row))
-            except Exception as _cap_e:
-                print(f"[EXPORT] BOM section expansion skipped: {_cap_e}")
-
+                try:
+                    line_id = int(str(node.id).split(":", 1)[1])
+                    row = by_line_id.get(line_id) or {}
+                    raw = row.get("input_raw_json") or {}
+                    if isinstance(raw, str):
+                        try:
+                            raw = json.loads(raw)
+                        except Exception:
+                            raw = {}
+                    if isinstance(raw, dict):
+                        return (raw.get("raw_fields") or {}).get("designator", "") or ""
+                except Exception:
+                    pass
+                return ""
 
             for node in ready_nodes:
-                cpn = (getattr(node, "internal_part_number", "") or getattr(node, "assigned_part_number", "") or "").strip() or "NEW"
-                sec = self.get_node_bom_section(node.id)
-                bucket, type_val = section_bucket(sec)
-
-                line_id = 0
                 try:
-                    _ws, _line = (node.id or "").split(":", 1)
-                    line_id = int(_line)
+                    line_id = int(str(node.id).split(":", 1)[1])
                 except Exception:
                     line_id = 0
-                jr = by_line_id.get(line_id, {}) if line_id else {}
-
+                joined_row = by_line_id.get(line_id, {}) if line_id else {}
+                raw = joined_row.get("input_raw_json") or {}
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except Exception:
+                        raw = {}
+                raw_fields = raw.get("raw_fields") if isinstance(raw, dict) else {}
                 qty = ""
-                for k in ("input_qty", "qty", "input_quantity", "quantity"):
-                    if k in jr and jr.get(k) not in (None, ""):
-                        qty = jr.get(k)
-                        break
-                if qty in (None, ""):
-                    raw = jr.get("input_raw_json") or {}
-                    if isinstance(raw, str):
-                        try:
-                            raw = json.loads(raw)
-                        except Exception:
-                            raw = {}
-                    if isinstance(raw, dict):
-                        qty = (raw.get("raw_fields") or {}).get("quantity", "") or raw.get("qty", "") or ""
-
-                refdes = ""
-                for k in ("input_refdes", "refdes", "input_designator", "designator"):
-                    if k in jr and jr.get(k) not in (None, ""):
-                        refdes = jr.get(k)
-                        break
-                if not refdes:
-                    raw = jr.get("input_raw_json") or {}
-                    if isinstance(raw, str):
-                        try:
-                            raw = json.loads(raw)
-                        except Exception:
-                            raw = {}
-                    if isinstance(raw, dict):
-                        refdes = (raw.get("raw_fields") or {}).get("designator", "") or ""
-
+                refdes = _get_designator(node)
+                try:
+                    qty = (raw_fields.get("quantity") or raw_fields.get("qty") or raw_fields.get("qnty") or "")
+                except Exception:
+                    qty = ""
+                sec = self.get_node_bom_section(node.id)
+                bucket, type_val = section_bucket(sec)
+                cpn = (getattr(node, "internal_part_number", "") or getattr(node, "assigned_part_number", "") or "NEW").strip()
                 desc = self._export_description_for_node(node)
                 mfg, mfgpn = export_mfg_fields(node)
-
                 row_idx = write_row_by_section.get(bucket) or (bom_ws.max_row + 1)
                 item = item_counters[bucket]
                 item_counters[bucket] += 1
-
                 bom_ws.cell(row=row_idx, column=1, value=item)
                 bom_ws.cell(row=row_idx, column=2, value=cpn)
                 bom_ws.cell(row=row_idx, column=3, value=desc)
@@ -3320,191 +3594,206 @@ class DecisionController:
                 bom_ws.cell(row=row_idx, column=6, value=type_val)
                 bom_ws.cell(row=row_idx, column=7, value=mfg)
                 bom_ws.cell(row=row_idx, column=8, value=mfgpn)
-
                 write_row_by_section[bucket] = row_idx + 1
-            # NPR (use NPR template if present)
-            try:
-                npr_template_path = Path(self.cfg.npr_template_path)
-            except Exception:
-                npr_template_path = Path(str(getattr(self.cfg, "npr_template_path", "") or ""))
 
-            if npr_template_path and npr_template_path.exists():
-                try:
-                    npr_twb = load_workbook(npr_template_path)
-                    npr_tws = npr_twb[npr_twb.sheetnames[0]]
-                    # recreate NPR sheet to avoid stale content
-                    if "NPR" in wb.sheetnames:
-                        wb.remove(wb["NPR"])
-                    npr_ws = wb.create_sheet("NPR")
-
-                    # Copy values + core styles
-                    from copy import copy as _cpy
-                    for r in range(1, npr_tws.max_row + 1):
-                        npr_ws.row_dimensions[r].height = npr_tws.row_dimensions[r].height
-                        for c in range(1, npr_tws.max_column + 1):
-                            s = npr_tws.cell(row=r, column=c)
-                            d = npr_ws.cell(row=r, column=c, value=s.value)
-                            d._style = _cpy(s._style)
-                            d.number_format = s.number_format
-                            d.font = _cpy(s.font)
-                            d.fill = _cpy(s.fill)
-                            d.border = _cpy(s.border)
-                            d.alignment = _cpy(s.alignment)
-                            d.protection = _cpy(s.protection)
-
-                    # Copy column widths
-                    try:
-                        for col_letter, dim in npr_tws.column_dimensions.items():
-                            npr_ws.column_dimensions[col_letter].width = dim.width
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print(f"[EXPORT] NPR template copy failed, falling back: {e}")
-                    if "NPR" in wb.sheetnames:
-                        npr_ws = wb["NPR"]
-                    else:
-                        npr_ws = wb.create_sheet("NPR")
-                    npr_ws.delete_rows(1, npr_ws.max_row)
-                    npr_ws.append(["Company PN", "Status", "Description", "MPN", "Notes"])
+            npr_template_path = Path(str(getattr(self.cfg, "npr_template_path", "") or ""))
+            if "NPR" in wb.sheetnames:
+                wb.remove(wb["NPR"])
+            npr_ws = wb.create_sheet("NPR")
+            if npr_template_path.exists():
+                npr_twb = load_workbook(npr_template_path)
+                _copy_sheet_template(npr_twb[npr_twb.sheetnames[0]], npr_ws)
             else:
-                if "NPR" in wb.sheetnames:
-                    npr_ws = wb["NPR"]
-                else:
-                    npr_ws = wb.create_sheet("NPR")
-                npr_ws.delete_rows(1, npr_ws.max_row)
-                npr_ws.append(["Company PN", "Status", "Description", "MPN", "Notes"])
+                npr_ws.append(["Part Number", "Part Status (new / exists)", "Item Description", "Custom Fields- SMT, TH, Process, Assembly,PCB, Mechanical", "Preferred Part", "Unit Cost", "Default Units of Measure", "Stock Unit-EA, ml, ounce, gram", "per", "Purchase Unit", "Manufacturer Name", "Manufacturer Part #", "Supplier", "Lead Time (WKS)", "QC Required"])
 
-            # Find the NPR header row if template is used; otherwise header is at row 1
-            npr_header_row = 1
-            try:
-                for r in range(1, min(npr_ws.max_row, 200) + 1):
-                    a = str(npr_ws.cell(row=r, column=1).value or "").strip().lower()
-                    b = str(npr_ws.cell(row=r, column=2).value or "").strip().lower()
-                    c = str(npr_ws.cell(row=r, column=3).value or "").strip().lower()
-                    d = str(npr_ws.cell(row=r, column=4).value or "").strip().lower()
-                    e = str(npr_ws.cell(row=r, column=5).value or "").strip().lower()
-                    if a == "company pn" and b == "status" and c == "description" and d == "mpn" and e == "notes":
-                        npr_header_row = r
-                        break
-            except Exception:
+            npr_header_row = _find_header_row(npr_ws, {1: "part number", 2: "part status (new / exists)", 3: "item description"})
+            if not npr_header_row:
                 npr_header_row = 1
+            npr_write_row_ref = [npr_header_row + 1]
+            npr_style_row = npr_write_row_ref[0] if npr_write_row_ref[0] <= npr_ws.max_row else npr_header_row
 
-            # Determine first empty write row under the NPR header (template may already contain content)
-            npr_write_row = npr_header_row + 1
+            def _ensure_npr_row(row_idx: int):
+                if row_idx > npr_ws.max_row:
+                    npr_ws.insert_rows(npr_ws.max_row + 1, amount=(row_idx - npr_ws.max_row))
+                _copy_row_style(npr_ws, npr_style_row, row_idx)
+
+            alts_template_path = Path(os.path.dirname(os.path.abspath(__file__))) / "ALTS_template.xlsx"
+            if "Alternates for Approval" in wb.sheetnames:
+                wb.remove(wb["Alternates for Approval"])
+            ws_alt = wb.create_sheet("Alternates for Approval")
+            if alts_template_path.exists():
+                alts_twb = load_workbook(alts_template_path)
+                _copy_sheet_template(alts_twb[alts_twb.sheetnames[0]], ws_alt)
+            else:
+                ws_alt.append(["ELAN Inventory PN", "MfgNs under this PN", "Manufacturer", "link", "DESC", "BOM MfgN subbing for", "Designator", "NOTES"])
+
             try:
-                r = npr_write_row
-                while r <= npr_ws.max_row:
-                    if all(str(npr_ws.cell(row=r, column=cc).value or "").strip() == "" for cc in range(1, 6)):
-                        break
-                    r += 1
-                npr_write_row = r if r <= npr_ws.max_row else (npr_ws.max_row + 1)
+                for mr in list(ws_alt.merged_cells.ranges):
+                    min_col, min_row, max_col, max_row = range_boundaries(str(mr))
+                    if 5 <= min_row <= 200:
+                        ws_alt.unmerge_cells(str(mr))
             except Exception:
-                npr_write_row = npr_ws.max_row + 1
+                pass
 
+            inv_alt_write_row_ref = [5]
+            ext_header_row_ref = [23]
+            ext_alt_write_row_ref = [26]
+            inv_style_row = 5
+            ext_style_row_ref = [26]
 
-            def uniq_keep_order(items):
-                seen = set()
-                out = []
-                for x in items:
-                    x = (x or "").strip()
-                    if not x:
-                        continue
-                    k = x.lower()
-                    if k in seen:
-                        continue
-                    seen.add(k)
-                    out.append(x)
-                return out
+            def _ensure_alts_inv_row(row_idx: int):
+                if row_idx >= ext_header_row_ref[0]:
+                    ws_alt.insert_rows(ext_header_row_ref[0], amount=1)
+                    _copy_row_style(ws_alt, inv_style_row, ext_header_row_ref[0])
+                    ext_header_row_ref[0] += 1
+                    ext_alt_write_row_ref[0] += 1
+                    ext_style_row_ref[0] += 1
+                _copy_row_style(ws_alt, inv_style_row, row_idx)
 
-            for node in ready_nodes:
-                anchored_existing = bool((getattr(node, "internal_part_number", "") or "").strip())
-                company_pn = (getattr(node, "internal_part_number", "") or getattr(node, "assigned_part_number", "") or "NEW").strip()
-                status = "EXISTING" if anchored_existing else "NEW"
-                desc = self._export_description_for_node(node)
-                bom_mpn = (getattr(node, "bom_mpn", "") or "").strip()
-                notes = (getattr(node, "notes", "") or "").strip()
+            def _ensure_alts_ext_row(row_idx: int):
+                if row_idx > ws_alt.max_row:
+                    ws_alt.insert_rows(ws_alt.max_row + 1, amount=(row_idx - ws_alt.max_row))
+                _copy_row_style(ws_alt, ext_style_row_ref[0], row_idx)
 
-                alt_mpns = []
+            def _node_export_case(node):
+                selected_inventory = self._selected_inventory_alt(node)
+                selected_externals = self._selected_external_alts(node)
+                active_selections = []
                 try:
-                    for alt in (node.selected_alternates() or []):
-                        if (getattr(alt, "source", "") or "").lower() == "inventory":
-                            continue
-                        mpn = (getattr(alt, "manufacturer_part_number", "") or "").strip()
-                        if mpn:
-                            alt_mpns.append(mpn)
+                    active_selections = [a for a in (node.selected_alternates() or []) if not bool(getattr(a, "rejected", False))]
                 except Exception:
-                    pass
-                alt_mpns = uniq_keep_order(alt_mpns)
+                    active_selections = []
+                if selected_inventory is not None and selected_externals:
+                    return "internal_and_external", selected_inventory, selected_externals
+                if selected_inventory is not None:
+                    if bool(getattr(node, "needs_approval", False)):
+                        return "internal_only_approval", selected_inventory, []
+                    return "internal_only_skip", selected_inventory, []
+                if selected_externals:
+                    return "external_only", None, selected_externals
+                if not active_selections:
+                    return "new", None, []
+                return "new", None, []
 
-                first = bom_mpn or (alt_mpns.pop(0) if alt_mpns else "")
-                npr_ws.cell(row=npr_write_row, column=1, value=company_pn)
-                npr_ws.cell(row=npr_write_row, column=2, value=status)
-                npr_ws.cell(row=npr_write_row, column=3, value=desc)
-                npr_ws.cell(row=npr_write_row, column=4, value=first)
-                npr_ws.cell(row=npr_write_row, column=5, value=notes)
-                npr_write_row += 1
-                for mpn in alt_mpns:
-                    npr_ws.cell(row=npr_write_row, column=1, value=company_pn)
-                    npr_ws.cell(row=npr_write_row, column=2, value=status)
-                    npr_ws.cell(row=npr_write_row, column=3, value=desc)
-                    npr_ws.cell(row=npr_write_row, column=4, value=mpn)
-                    npr_ws.cell(row=npr_write_row, column=5, value=notes)
-                    npr_write_row += 1
+            def _write_npr_main_row(node, status: str):
+                row_idx = npr_write_row_ref[0]
+                _ensure_npr_row(row_idx)
+                company_pn = (getattr(node, "internal_part_number", "") or getattr(node, "assigned_part_number", "") or "NEW").strip() or "NEW"
+                desc = self._export_description_for_node(node)
+                notes = (getattr(node, "notes", "") or "").strip()
+                mfg, mfgpn = export_mfg_fields(node)
+                npr_ws.cell(row=row_idx, column=1, value=company_pn)
+                npr_ws.cell(row=row_idx, column=2, value=status)
+                npr_ws.cell(row=row_idx, column=3, value=desc)
+                npr_ws.cell(row=row_idx, column=11, value=mfg)
+                npr_ws.cell(row=row_idx, column=12, value=(mfgpn or (getattr(node, "bom_mpn", "") or "").strip()))
+                npr_ws.cell(row=row_idx, column=13, value="")
+                npr_ws.cell(row=row_idx, column=16, value=notes)
+                npr_write_row_ref[0] += 1
 
-            # Approvals + Bomexistences
-            ws_alt.delete_rows(1, ws_alt.max_row)
-            ws_alt.append(["BOM_UID", "BOM_MPN", "EXPORT_DESC", "INTERNAL_PN", "INVENTORY_MPN", "SOURCE", "MFG", "SUPPLIER", "NOTES"])
+            def _write_npr_external_row(node, alt):
+                row_idx = npr_write_row_ref[0]
+                _ensure_npr_row(row_idx)
+                company_pn = (getattr(node, "internal_part_number", "") or getattr(node, "assigned_part_number", "") or "NEW").strip() or "NEW"
+                desc = self._export_description_for_node(node)
+                notes = (getattr(node, "notes", "") or "").strip()
+                npr_ws.cell(row=row_idx, column=1, value=company_pn)
+                npr_ws.cell(row=row_idx, column=2, value="EXISTING" if (getattr(node, "internal_part_number", "") or "").strip() else "NEW")
+                npr_ws.cell(row=row_idx, column=3, value=desc)
+                npr_ws.cell(row=row_idx, column=11, value=(getattr(alt, "manufacturer", "") or "").strip())
+                npr_ws.cell(row=row_idx, column=12, value=(getattr(alt, "manufacturer_part_number", "") or "").strip())
+                npr_ws.cell(row=row_idx, column=13, value=(getattr(alt, "supplier", "") or "").strip())
+                npr_ws.cell(row=row_idx, column=16, value=notes)
+                npr_write_row_ref[0] += 1
 
-            ws_bomexist.delete_rows(1, ws_bomexist.max_row)
+            def _write_inventory_alt_rows(node, inv_alt):
+                if inv_alt is None:
+                    return
+                family = self._inventory_family_members(inv_alt)
+                if not family:
+                    family = [{
+                        "manufacturer_part_number": (getattr(inv_alt, "manufacturer_part_number", "") or "").strip(),
+                        "manufacturer": (getattr(inv_alt, "manufacturer", "") or "").strip(),
+                        "description": (getattr(inv_alt, "description", "") or "").strip(),
+                        "supplier": (getattr(inv_alt, "supplier", "") or "").strip(),
+                    }]
+                designator = _get_designator(node)
+                notes = (getattr(node, "notes", "") or "").strip()
+                bom_mpn = (getattr(node, "bom_mpn", "") or "").strip()
+                company_pn = (getattr(inv_alt, "internal_part_number", "") or getattr(node, "internal_part_number", "") or getattr(node, "assigned_part_number", "") or "").strip()
+                for member in family:
+                    row_idx = inv_alt_write_row_ref[0]
+                    _ensure_alts_inv_row(row_idx)
+                    ws_alt.cell(row=row_idx, column=1, value=company_pn)
+                    ws_alt.cell(row=row_idx, column=2, value=member.get("manufacturer_part_number", ""))
+                    ws_alt.cell(row=row_idx, column=3, value=member.get("manufacturer", ""))
+                    ws_alt.cell(row=row_idx, column=4, value="")
+                    ws_alt.cell(row=row_idx, column=5, value=(member.get("description") or self._export_description_for_node(node)))
+                    ws_alt.cell(row=row_idx, column=6, value=bom_mpn)
+                    ws_alt.cell(row=row_idx, column=7, value=designator)
+                    ws_alt.cell(row=row_idx, column=8, value=notes)
+                    inv_alt_write_row_ref[0] += 1
+
+            def _write_external_alt_rows(node, ext_alts):
+                designator = _get_designator(node)
+                notes = (getattr(node, "notes", "") or "").strip()
+                bom_mpn = (getattr(node, "bom_mpn", "") or "").strip()
+                for alt in ext_alts:
+                    row_idx = ext_alt_write_row_ref[0]
+                    _ensure_alts_ext_row(row_idx)
+                    ws_alt.cell(row=row_idx, column=2, value=(getattr(alt, "manufacturer_part_number", "") or "").strip())
+                    ws_alt.cell(row=row_idx, column=3, value=(getattr(alt, "manufacturer", "") or "").strip())
+                    ws_alt.cell(row=row_idx, column=4, value="")
+                    ws_alt.cell(row=row_idx, column=5, value=(getattr(alt, "description", "") or self._export_description_for_node(node)))
+                    ws_alt.cell(row=row_idx, column=6, value=bom_mpn)
+                    ws_alt.cell(row=row_idx, column=7, value=designator)
+                    ws_alt.cell(row=row_idx, column=8, value=notes)
+                    ext_alt_write_row_ref[0] += 1
+
+            if "BOMNOTES" in wb.sheetnames:
+                ws_bomexist = wb["BOMNOTES"]
+                ws_bomexist.delete_rows(1, ws_bomexist.max_row)
+            else:
+                ws_bomexist = wb.create_sheet("BOMNOTES")
             ws_bomexist.append(["BOM_UID", "BOM_MPN", "BOM_DESC", "COMPANY_PN", "STATUS", "NOTES"])
 
             for node in ready_nodes:
-                anchored_existing = bool((getattr(node, "internal_part_number", "") or "").strip())
-                company_pn = (getattr(node, "internal_part_number", "") or getattr(node, "assigned_part_number", "") or "NEW").strip()
-                status = "EXISTING" if anchored_existing else "NEW"
-
+                export_case, inv_alt, ext_alts = _node_export_case(node)
+                company_pn = (getattr(node, "internal_part_number", "") or getattr(node, "assigned_part_number", "") or "NEW").strip() or "NEW"
+                status = "EXISTING" if company_pn != "NEW" and (getattr(node, "internal_part_number", "") or "").strip() else "NEW"
                 ws_bomexist.append([
                     (getattr(node, "bom_uid", "") or ""),
                     (getattr(node, "bom_mpn", "") or ""),
-                    (getattr(node, "description", "") or ""),
+                    self._export_description_for_node(node),
                     company_pn,
                     status,
                     (getattr(node, "notes", "") or ""),
                 ])
 
-                inv_alt = self._selected_inventory_alt(node)
-                if inv_alt is not None and anchored_existing:
-                    ws_alt.append([
-                        (getattr(node, "bom_uid", "") or ""),
-                        (getattr(node, "bom_mpn", "") or ""),
-                        self._export_description_for_node(node),
-                        (getattr(inv_alt, "internal_part_number", "") or ""),
-                        (getattr(inv_alt, "manufacturer_part_number", "") or ""),
-                        "inventory",
-                        (getattr(inv_alt, "manufacturer", "") or ""),
-                        (getattr(inv_alt, "supplier", "") or ""),
-                        (getattr(node, "notes", "") or ""),
-                    ])
+                if export_case == "new":
+                    _write_npr_main_row(node, "NEW")
+                    continue
 
-                try:
-                    for alt in (node.selected_alternates() or []):
-                        if (getattr(alt, "source", "") or "").lower() != "inventory":
-                            continue
-                        if inv_alt is not None and getattr(alt, "internal_part_number", "") == getattr(inv_alt, "internal_part_number", ""):
-                            continue
-                        ws_alt.append([
-                            (getattr(node, "bom_uid", "") or ""),
-                            (getattr(node, "bom_mpn", "") or ""),
-                            self._export_description_for_node(node),
-                            (getattr(alt, "internal_part_number", "") or ""),
-                            (getattr(alt, "manufacturer_part_number", "") or ""),
-                            "inventory",
-                            (getattr(alt, "manufacturer", "") or ""),
-                            (getattr(alt, "supplier", "") or ""),
-                            (getattr(node, "notes", "") or ""),
-                        ])
-                except Exception:
-                    pass
+                if export_case == "internal_only_skip":
+                    continue
+
+                if export_case == "internal_only_approval":
+                    _write_inventory_alt_rows(node, inv_alt)
+                    continue
+
+                if export_case == "external_only":
+                    _write_npr_main_row(node, "NEW")
+                    _write_external_alt_rows(node, ext_alts)
+                    for alt in ext_alts:
+                        _write_npr_external_row(node, alt)
+                    continue
+
+                if export_case == "internal_and_external":
+                    _write_npr_main_row(node, "EXISTING")
+                    _write_external_alt_rows(node, ext_alts)
+                    for alt in ext_alts:
+                        _write_npr_external_row(node, alt)
+                    continue
 
             if not output_path:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3536,26 +3825,18 @@ class DecisionController:
 
     def _recompute_node_flags(self, node: DecisionNode) -> None:
         """
-        Central place for status/approval heuristics.
-        UI should just display these.
+        Central place for status heuristics.
+        The approval-sheet flag is user-controlled and must not be auto-overwritten here.
         """
         bt = node.base_type.upper()
         selected = len(node.selected_alternates())
         candidates = len(node.candidate_alternates())
 
-        # Needs approval heuristic
-        if bt == "NEW":
-            node.needs_approval = True
-        elif bt == "EXISTS":
-            node.needs_approval = selected > 0
-        else:
-            node.needs_approval = selected > 0
+        node.needs_approval = bool(getattr(node, "needs_approval", False))
 
-        # Status heuristic unless already READY/locked
         if node.locked:
             node.status = DecisionStatus.READY_FOR_EXPORT
             return
-    
 
         if bt == "NEW" and selected == 0:
             node.status = DecisionStatus.NEEDS_ALTERNATE
@@ -3565,7 +3846,6 @@ class DecisionController:
             node.status = DecisionStatus.NEEDS_DECISION
             return
 
-        # default: auto-ish state (still editable)
         node.status = DecisionStatus.FULL_MATCH
 
 

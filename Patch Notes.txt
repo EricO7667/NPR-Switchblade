@@ -1,0 +1,48 @@
+Patch notes V3:
+1) TK replacement of ui elements with CTTK elements
+2) integration of sql database holding extract informaiton and workspace saving and deletion (unfishished integration)
+3) Matching engine improvments. 
+	A) Normilization of manufactuering part numbers. No longer skips manufactuering part numbers that are 100% fullmatch for existence due to differences in spacings and symbols. 
+	B) Family Filtering logic introduced: added 4 filtering tiers that run threading in parrallel in order to find family variations. Output is seeded into matching AI pipeline.
+		i)progressive_prefix
+		ii)token_overlap
+		iii)Levenshtein
+		iV) ngram_jaccard
+	
+4) Exporting imporvments
+	A) updated exporting to be to format of the BOM elan format, along with UI integration of dropdown selction of part type (SMT, throughhole, auxillary)
+5) Added description changing element to the UI for exporting logic. 
+6) Upgraded UI logic for selction of alternate part for export if needed, small quality of life change for clarical export work. 
+7) Upgraded UI logic:
+	A)Fix stock issue on cards being repeated on incorrect cards
+	B)changing description managment to pull from description box instead of from database from selction, issue resolved reguarding selcting a card and passing the wrong manufactuering part
+	C)Fix for description showcaseing on card slection, no show inside of the description box in th eheder
+	D)Fix for CNS suggetsion box trying to suggest whole part unmbers, now suggestes catergory prefix and body (to be chnaged later with porper CNS integration, but reintroduce Parser for proper logic)
+	E)Addition of Auto rejection button for all Cards
+	F)given the abiltyfor the user to ignore the CNS apply button and go stright to export
+	G)addition of an UNMARK READY button to not soft lock the user anymore
+	F) show cases the selected part number from the card into the CNS edit box on addition of card
+	H) fixed apply part number toon to be alloed ony on a rejection of all cards. Same for description box (removed button)
+	I) implomented locking fucnitonlty of ui elements to simulate "states" of progressive_prefix
+8) optimization imporvments	
+	A) changed cacheing logic, less chacheing more utlization of DB, imorves speed of loading POST intiliazation
+	B) removed loading bar popup on a runmatching, intengration plan for loading bar into main UI started. 
+	
+	
+
+Patch notes V3.1:
+1) Reintegration of Parsing engine 
+	One of the bigger concerns for the program has been introducing a proper parsing engine which can handle CNS parsing, Inentory parsing, and quantity value recognition for matching engine hydration.
+	For no the porgrm operates off simple regex snipits that allowed me to do quick and easy parseing. For he CNS parsing and parttype matching this is true. 
+	The main purpose of the parsing engine reitgration patch is to hold and imporve upon those snipits into one locolaized area, and to provide the foundation for hardgateing the systems wuanititative values.
+	Another purpose of th aparsing engine is to give the program a means to start excessing the new compnents schema listings that I am building, where I describe the specs of each compents category for the inventory normilaization.
+	Right now the only part type matching foundation is a yaml file filled with confidenc levels and the most common word types per compnent category from the CNS that we have. its primitive but works for now and is company specifc 
+	and for the most part only useful for the inventory mantching rather than a standalone quanitiative parsing syetm, which the parsing engine stands to solve. 
+	
+2) TODO: patched the ui cards to stop stretchingot the size of the grid they were instantiated into. (attempted)
+3) Reintroduced the Loading Bar under the CTTK library instead of tk. Now loads for th emaster inventroy file and the ERP inventory file.
+4) plans to remove CNS parsing at startup.
+5) Optimization changes
+	A) Splade is hashed like the embedded semantic cache and saved into the database for quick edititng retrival and acess. no loger goes over entire inventory per run. Cut run time by 10 minutes every change in the master or erp.
+6) Introducing New NPR logic and exporting logic for approvals, substitutes, and existences.
+7) Start of mapping of external alternates into the program. 

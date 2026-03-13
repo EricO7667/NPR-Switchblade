@@ -1038,3 +1038,129 @@ class MatchAltRepo:
             d["raw_json"] = json_loads(d.get("raw_json"), default={})
             out.append(d)
         return out
+
+
+# =============================================================================
+# SpladeCacheRepo
+# =============================================================================
+class SpladeCacheRepo:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def load_rows(
+        self,
+        *,
+        model_name: str,
+        preprocess_version: int,
+        max_len: int,
+        top_terms: int,
+        row_keys: Sequence[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        keys = [str(k or "").strip() for k in (row_keys or []) if str(k or "").strip()]
+        if not keys:
+            return {}
+
+        out: Dict[str, Dict[str, Any]] = {}
+        chunk = 500
+        for i in range(0, len(keys), chunk):
+            subset = keys[i:i+chunk]
+            qmarks = ",".join("?" for _ in subset)
+            rows = self.conn.execute(
+                f"""
+                SELECT row_key, row_hash, term_ids_blob, term_wts_blob, doc_norm, updated_at
+                FROM splade_doc_cache
+                WHERE model_name = ?
+                  AND preprocess_version = ?
+                  AND max_len = ?
+                  AND top_terms = ?
+                  AND row_key IN ({qmarks});
+                """,
+                [model_name, int(preprocess_version), int(max_len), int(top_terms), *subset],
+            ).fetchall()
+            for r in rows:
+                out[str(r["row_key"])] = dict(r)
+        return out
+
+    def upsert_rows(
+        self,
+        *,
+        model_name: str,
+        preprocess_version: int,
+        max_len: int,
+        top_terms: int,
+        rows: Sequence[Dict[str, Any]],
+        updated_at: Optional[str] = None,
+    ) -> int:
+        updated_at = updated_at or _now_iso()
+        count = 0
+        with _DB_LOCK, self.conn:
+            for row in (rows or []):
+                row_key = str((row or {}).get("row_key", "") or "").strip()
+                if not row_key:
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO splade_doc_cache (
+                        model_name, preprocess_version, max_len, top_terms,
+                        row_key, row_hash,
+                        term_ids_blob, term_wts_blob, doc_norm, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(model_name, preprocess_version, max_len, top_terms, row_key) DO UPDATE SET
+                        row_hash=excluded.row_hash,
+                        term_ids_blob=excluded.term_ids_blob,
+                        term_wts_blob=excluded.term_wts_blob,
+                        doc_norm=excluded.doc_norm,
+                        updated_at=excluded.updated_at;
+                    """,
+                    (
+                        model_name,
+                        int(preprocess_version),
+                        int(max_len),
+                        int(top_terms),
+                        row_key,
+                        str((row or {}).get("row_hash", "") or ""),
+                        sqlite3.Binary((row or {}).get("term_ids_blob", b"")),
+                        sqlite3.Binary((row or {}).get("term_wts_blob", b"")),
+                        float((row or {}).get("doc_norm", 1.0) or 1.0),
+                        updated_at,
+                    ),
+                )
+                count += 1
+        return count
+
+    def prune_missing_row_keys(
+        self,
+        *,
+        model_name: str,
+        preprocess_version: int,
+        max_len: int,
+        top_terms: int,
+        active_row_keys: Sequence[str],
+    ) -> int:
+        active = [str(k or "").strip() for k in (active_row_keys or []) if str(k or "").strip()]
+        with _DB_LOCK, self.conn:
+            if active:
+                qmarks = ",".join("?" for _ in active)
+                cur = self.conn.execute(
+                    f"""
+                    DELETE FROM splade_doc_cache
+                    WHERE model_name = ?
+                      AND preprocess_version = ?
+                      AND max_len = ?
+                      AND top_terms = ?
+                      AND row_key NOT IN ({qmarks});
+                    """,
+                    [model_name, int(preprocess_version), int(max_len), int(top_terms), *active],
+                )
+            else:
+                cur = self.conn.execute(
+                    """
+                    DELETE FROM splade_doc_cache
+                    WHERE model_name = ?
+                      AND preprocess_version = ?
+                      AND max_len = ?
+                      AND top_terms = ?;
+                    """,
+                    (model_name, int(preprocess_version), int(max_len), int(top_terms)),
+                )
+        return int(getattr(cur, "rowcount", 0) or 0)

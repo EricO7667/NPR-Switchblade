@@ -300,4 +300,26 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS ix_match_alt_selected ON match_alt(workspace_id, run_id, node_id, selected, rejected);")
 
 
+    # Incremental SPLADE doc cache (row-addressable, model/config scoped)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS splade_doc_cache (
+            model_name TEXT NOT NULL,
+            preprocess_version INTEGER NOT NULL,
+            max_len INTEGER NOT NULL,
+            top_terms INTEGER NOT NULL,
+            row_key TEXT NOT NULL,
+            row_hash TEXT NOT NULL,
+            term_ids_blob BLOB NOT NULL,
+            term_wts_blob BLOB NOT NULL,
+            doc_norm REAL NOT NULL DEFAULT 1.0,
+            updated_at TEXT NOT NULL,
+
+            PRIMARY KEY (model_name, preprocess_version, max_len, top_terms, row_key)
+        );
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_splade_cache_cfg ON splade_doc_cache(model_name, preprocess_version, max_len, top_terms);")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_splade_cache_hash ON splade_doc_cache(model_name, preprocess_version, max_len, top_terms, row_hash);")
+
 
