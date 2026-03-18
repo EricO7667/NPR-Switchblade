@@ -3,24 +3,48 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from dataclasses import dataclass, field
+from platformdirs import user_data_dir
 
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+APP_NAME = "NPRTool"
+
+
+def app_data_dir() -> Path:
+    home = Path.home()
+
+    if sys.platform.startswith("win"):
+        base = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = home / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME", home / ".local" / "share"))
+
+    path = base / APP_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def default_db_path() -> str:
-    base_dir = Path(os.path.dirname(os.path.abspath(__file__)))
-    db_dir = base_dir / "data"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    return str(db_dir / "npr.db")
+    override = os.environ.get("NPR_DB_PATH")
+    if override:
+        p = Path(override)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return str(p)
+
+    return str(app_data_dir() / "npr.db")
 
 
 @dataclass(frozen=True)
 class DBConfig:
-    path: str = default_db_path()
+    path: str = field(default_factory=default_db_path)
     timeout_s: float = 30.0
-
 
 def connect_db(cfg: Optional[DBConfig] = None) -> sqlite3.Connection:
     cfg = cfg or DBConfig()

@@ -1,5 +1,4 @@
-#new testing UI and decsion controller logic utilizing an SQL DB and a different ui python package to make it look more sleek.
-# alot of things are broken still heavily in development from the old UI
+
 
 from __future__ import annotations
 
@@ -51,6 +50,9 @@ class DecisionWorkspaceCTK:
         self._loading_started_at = 0.0
 
         self.current_node_id: Optional[str] = None
+        self._node_tree_menu = None
+        self._node_tree_ctx_item = None
+        self._node_tree_ctx_col = None
         self._pinned_alt_id: Optional[str] = None
         self._last_specs_key = None
         self._suspend_node_select = False
@@ -228,6 +230,8 @@ class DecisionWorkspaceCTK:
         vs.pack(side="right", fill="y")
 
         self.node_tree.bind("<<TreeviewSelect>>", self._on_node_select)
+        self.node_tree.bind("<Control-c>", self._copy_selected_node_rows)
+        self.node_tree.bind("<Button-3>", self._on_node_tree_right_click)
         try:
             self.node_tree.tag_configure("row_ready", background="#123A24", foreground="#E5E7EB")
             self.node_tree.tag_configure("row_selected", background="#0F2E4A", foreground="#E5E7EB")
@@ -423,7 +427,8 @@ class DecisionWorkspaceCTK:
                 alts = list(getattr(node, "alternates", []) or [])
                 selected_count = sum(1 for a in alts if getattr(a, "selected", False))
                 active_count = sum(1 for a in alts if not getattr(a, "rejected", False))
-                if bool(getattr(node, "locked", False)):
+                node_status = getattr(getattr(node, "status", None), "value", str(getattr(node, "status", "")))
+                if str(node_status) == "READY_FOR_EXPORT":
                     tags = ["row_ready"]
                 elif selected_count > 0:
                     tags = ["row_selected"]
@@ -469,6 +474,102 @@ class DecisionWorkspaceCTK:
         self._render_header_state(node)
         self._render_cards(node)
         self._render_specs_for_node(node)
+
+    def _node_tree_column_name(self, col_id: str) -> str:
+        try:
+            if not col_id:
+                return ""
+            idx = int(str(col_id).replace("#", "")) - 1
+            cols = list(self.node_tree["columns"])
+            if 0 <= idx < len(cols):
+                return str(cols[idx])
+        except Exception:
+            pass
+        return ""
+
+    def _copy_selected_node_rows(self, _event=None):
+        try:
+            sel = list(self.node_tree.selection() or [])
+            if not sel:
+                return "break"
+            cols = list(self.node_tree["columns"])
+            lines = ["	".join(cols)]
+            for item in sel:
+                vals = [str(v) for v in (self.node_tree.item(item, "values") or [])]
+                lines.append("	".join(vals))
+            self._copy_to_clipboard("\n".join(lines), toast=f"Copied {len(sel)} row(s)")
+        except Exception as e:
+            messagebox.showerror("Copy Failed", str(e))
+        return "break"
+
+    def _copy_node_tree_cell(self):
+        item = getattr(self, "_node_tree_ctx_item", None)
+        col = getattr(self, "_node_tree_ctx_col", None)
+        if not item or not col:
+            return
+        try:
+            values = list(self.node_tree.item(item, "values") or [])
+            idx = int(str(col).replace("#", "")) - 1
+            if idx < 0 or idx >= len(values):
+                return
+            header = self._node_tree_column_name(col)
+            self._copy_to_clipboard(str(values[idx]), toast=f"Copied {header or 'cell'}")
+        except Exception as e:
+            messagebox.showerror("Copy Failed", str(e))
+
+    def _copy_node_tree_row(self):
+        item = getattr(self, "_node_tree_ctx_item", None)
+        if not item:
+            return
+        try:
+            cols = list(self.node_tree["columns"])
+            vals = [str(v) for v in (self.node_tree.item(item, "values") or [])]
+            text = "\n".join(f"{c}: {v}" for c, v in zip(cols, vals))
+            self._copy_to_clipboard(text, toast="Copied row")
+        except Exception as e:
+            messagebox.showerror("Copy Failed", str(e))
+
+    def _copy_node_tree_column(self):
+        col = getattr(self, "_node_tree_ctx_col", None)
+        if not col:
+            return
+        try:
+            idx = int(str(col).replace("#", "")) - 1
+            if idx < 0:
+                return
+            header = self._node_tree_column_name(col)
+            values = []
+            for item in self.node_tree.get_children():
+                row_vals = list(self.node_tree.item(item, "values") or [])
+                if idx < len(row_vals):
+                    values.append(str(row_vals[idx]))
+            payload = "\n".join(([header] if header else []) + values)
+            self._copy_to_clipboard(payload, toast=f"Copied column {header or idx+1}")
+        except Exception as e:
+            messagebox.showerror("Copy Failed", str(e))
+
+    def _on_node_tree_right_click(self, event):
+        menu = None
+        try:
+            item = self.node_tree.identify_row(event.y)
+            col = self.node_tree.identify_column(event.x)
+            if item:
+                self.node_tree.selection_set(item)
+                self.node_tree.focus(item)
+            self._node_tree_ctx_item = item
+            self._node_tree_ctx_col = col
+
+            menu = tk.Menu(self.root, tearoff=0)
+            menu.add_command(label="Copy Cell", command=self._copy_node_tree_cell)
+            menu.add_command(label="Copy Row", command=self._copy_node_tree_row)
+            menu.add_command(label="Copy Column", command=self._copy_node_tree_column)
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                if menu is not None:
+                    menu.grab_release()
+            except Exception:
+                pass
 
     def _render_header_state(self, node: DecisionNode):
         # Header values are driven ONLY by committed state.
@@ -531,6 +632,8 @@ class DecisionWorkspaceCTK:
             self._suspend_bom_section_event = False
     
         locked = bool(getattr(node, "locked", False))
+        status_text = str(getattr(getattr(node, "status", None), "value", getattr(node, "status", "")))
+        is_ready = (status_text == "READY_FOR_EXPORT")
 
         try:
             self._suspend_approval_toggle = True
@@ -538,17 +641,22 @@ class DecisionWorkspaceCTK:
         finally:
             self._suspend_approval_toggle = False
     
-        # PN stays gated by reject-all (original behavior)
-        pn_unlock = (not locked) and all_rejected
+        # PN stays editable when the node is not hard-locked and there is no
+        # selected internal inventory card. This preserves manual editability
+        # for external-only selections while keeping internal-selected cases gated.
+        selected_is_internal = bool(
+            selected_alt is not None and getattr(selected_alt, "source", "") == "inventory"
+        )
+        pn_unlock = (not locked) and (all_rejected or not selected_is_internal)
     
-        # Description should be editable whenever unlocked (your request)
+        # Description should stay editable unless the node is hard-locked.
         desc_unlock = (not locked)
     
         try:
-            self.mark_ready_btn.configure(state=("disabled" if locked else "normal"))
-            self.unmark_ready_btn.configure(state=("normal" if locked else "disabled"))
-            self.bom_section_menu.configure(state="normal")
-            self.auto_reject_btn.configure(state="normal")
+            self.mark_ready_btn.configure(state=("disabled" if is_ready else "normal"))
+            self.unmark_ready_btn.configure(state=("normal" if is_ready else "disabled"))
+            self.bom_section_menu.configure(state=("disabled" if locked else "normal"))
+            self.auto_reject_btn.configure(state=("disabled" if locked else "normal"))
     
             self.company_pn_entry.configure(state=("normal" if pn_unlock else "disabled"))
             self.apply_pn_btn.configure(state=("normal" if pn_unlock else "disabled"))
@@ -954,16 +1062,12 @@ class DecisionWorkspaceCTK:
             pass
 
     def _render_specs(self, specs: dict):
-        def add_section(title: str):
-            ctk.CTkLabel(self.specs_scroll, text=title.upper(), text_color=self.COLORS["primary"],
-                         font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", pady=(8, 2))
-
         def add_kv(label: str, value):
             if value in (None, ""):
                 return
             row = ctk.CTkFrame(self.specs_scroll, fg_color="#111827", corner_radius=8)
             row.pack(fill="x", pady=3)
-            ctk.CTkLabel(row, text=label, width=140, anchor="w", text_color=self.COLORS["text_dim"]).pack(side="left", padx=(8, 4), pady=6)
+            ctk.CTkLabel(row, text=label, width=160, anchor="w", text_color=self.COLORS["text_dim"]).pack(side="left", padx=(8, 4), pady=6)
             val = str(value)
             box = ctk.CTkTextbox(row, height=(34 if "\n" not in val else min(120, 24 * (val.count("\n") + 2))), fg_color="#0B1220")
             box.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4)
@@ -974,25 +1078,60 @@ class DecisionWorkspaceCTK:
             except Exception:
                 pass
 
+        def pick(*keys):
+            for key in keys:
+                value = specs.get(key)
+                if value not in (None, ""):
+                    return value
+            return ""
+
         if not specs:
             ctk.CTkLabel(self.specs_scroll, text="No details available.", text_color=self.COLORS["text_dim"]).pack(anchor="w")
             return
 
-        for title, keys in [
-            ("Identity", ["ItemNumber", "VendorItem", "Description"]),
-            ("Manufacturing", ["MfgName", "MfgId", "PrimaryVendorNumber"]),
-            ("Logistics", ["TotalQty", "LastCost", "AvgCost", "ItemLeadTime", "DefaultWhse", "TariffCodeHTSUS"]),
-        ]:
-            add_section(title)
-            for k in keys:
-                add_kv(k, specs.get(k))
+        ordered_fields = [
+            ("Company Part Number", pick("CompanyPartNumber", "ItemNumber")),
+            ("Manufacturer Part Number", pick("ManufacturerPartNumber", "MasterManufacturerPN", "VendorItem")),
+            ("Manufacturer", pick("ManufacturerName", "MasterManufacturerName", "MfgName")),
+            ("Manufacturer ID", pick("ManufacturerId", "MasterMfgId", "MfgId")),
+            ("Active", pick("Active", "MasterActive")),
+            ("Tariff Code", pick("TariffCode", "MasterTariffCode", "TariffCodeHTSUS")),
+            ("Tariff Rate", pick("TariffRate", "MasterTariffRate")),
+            ("Last Cost", pick("LastCost", "MasterLastCost")),
+            ("Standard Cost", pick("StandardCost", "MasterStandardCost", "StdCost")),
+            ("Average Cost", pick("AverageCost", "MasterAverageCost", "AvgCost")),
+            ("Manufacturer Count", pick("ManufacturerCount", "MfgItemCount")),
+            ("Revision", pick("Revision")),
+            ("Lead Time", pick("LeadTime", "ItemLeadTime")),
+            ("Total Quantity", pick("TotalQuantity", "TotalQty")),
+        ]
+
+        rendered = 0
+        for label, value in ordered_fields:
+            if value in (None, ""):
+                continue
+            add_kv(label, value)
+            rendered += 1
+
+        if rendered == 0:
+            fallback_fields = [
+                ("Description", pick("Description")),
+                ("Supplier", pick("PrimaryVendorNumber", "Supplier")),
+                ("Stock", pick("Stock", "TotalQty")),
+                ("Cost", pick("UnitCost", "LastCost", "AvgCost")),
+                ("Notes", pick("Notes")),
+            ]
+            for label, value in fallback_fields:
+                add_kv(label, value)
 
         alts_raw = str(specs.get("AlternatesList", "") or "").strip()
-        if alts_raw or specs.get("AlternatesCount"):
-            add_section("Alternates")
-            add_kv("AlternatesCount", specs.get("AlternatesCount") or "")
-            for line in alts_raw.splitlines()[:100]:
-                add_kv("MPN", line)
+        alts_count = specs.get("AlternatesCount") or ""
+        if alts_count or alts_raw:
+            row = ctk.CTkFrame(self.specs_scroll, fg_color="#111827", corner_radius=8)
+            row.pack(fill="x", pady=(8, 3))
+            summary = f"{alts_count} available" if alts_count else "Available"
+            ctk.CTkLabel(row, text="Other MFG PNs", width=160, anchor="w", text_color=self.COLORS["text_dim"]).pack(side="left", padx=(8, 4), pady=6)
+            ctk.CTkLabel(row, text=summary, anchor="w", text_color="#E5E7EB").pack(side="left", padx=(0, 8), pady=6)
 
     def _specs_from_inventory(self, inv):
         _raw = dict(getattr(inv, "raw_fields", {}) or {})

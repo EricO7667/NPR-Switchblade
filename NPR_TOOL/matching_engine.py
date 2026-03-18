@@ -162,8 +162,8 @@ ENG_FUZZY_TOPK = 250            # how many best fuzzy candidates to keep
 # =====================================================
 # Family Filtering (seed generation) flags
 # =====================================================
-FAM_DEBUG = 1
-FAM_EXPORT = 1
+FAM_DEBUG = 0
+FAM_EXPORT = 0
 FAM_EXPORT_MAX_PER_METHOD = 25   # how many sample matches to write per method in detail logs
 FAM_EXPORT_MAX_FINAL = 200       # how many final deduped seeds to keep/export
 FAM_PARALLEL = 1                # run family filters concurrently (threads)
@@ -251,10 +251,14 @@ def _canonical_field_alias(field: str) -> str:
     aliases = {
         "value": "value",
         "resistance": "resistance",
+        "resistance_ohms": "resistance",
         "capacitance": "capacitance",
+        "capacitance_farads": "capacitance",
         "inductance": "inductance",
+        "inductance_henries": "inductance",
         "voltage": "voltage",
         "volts": "voltage",
+        "voltage_kind": "voltage_kind",
         "current": "current",
         "amps": "current",
         "power": "power",
@@ -264,38 +268,74 @@ def _canonical_field_alias(field: str) -> str:
         "package": "package",
         "standard": "package",
         "mount": "mount",
+        "auto": "mount",
         "pins": "pins",
         "pitch": "pitch",
         "frequency": "frequency",
         "frequency_hz": "frequency",
+        "temperature": "temperature",
+        "temp": "temperature",
+        "temp_c": "temperature",
+        "length": "length",
+        "width": "width",
+        "height": "height",
+        "diameter": "diameter",
+        "lead_spacing": "lead_spacing",
+        "ls": "lead_spacing",
+        "hex_size": "hex_size",
+        "channels": "channels",
+        "interfaces": "interfaces",
+        "memory_size": "memory_size",
+        "memory_type": "memory_type",
+        "brightness_mcd": "brightness_mcd",
         "description": "description",
         "text": "description",
     }
     return aliases.get(f, f)
 
+def _parsed_quant_specs(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    p = parsed or {}
+    qs = p.get("quantitative_specs")
+    return qs if isinstance(qs, dict) else {}
+
 def _parsed_value_by_field(parsed: Dict[str, Any], field: str):
     p = parsed or {}
+    q = _parsed_quant_specs(p)
     cf = _canonical_field_alias(field)
     candidates = {
-        "resistance": ["resistance", "value"],
-        "capacitance": ["capacitance", "value"],
-        "inductance": ["inductance", "value"],
+        "resistance": ["resistance", "resistance_ohms", "value"],
+        "capacitance": ["capacitance", "capacitance_farads", "value"],
+        "inductance": ["inductance", "inductance_henries", "value"],
         "voltage": ["voltage", "volts"],
+        "voltage_kind": ["voltage_kind"],
         "current": ["current", "amps"],
         "power": ["power", "wattage", "watts"],
         "tolerance": ["tolerance", "percent"],
         "package": ["package", "standard"],
-        "mount": ["mount"],
+        "mount": ["mount", "auto"],
         "pins": ["pins"],
         "pitch": ["pitch"],
         "frequency": ["frequency", "frequency_hz"],
+        "temperature": ["temperature", "temp_c", "temp"],
+        "length": ["length"],
+        "width": ["width"],
+        "height": ["height"],
+        "diameter": ["diameter"],
+        "lead_spacing": ["lead_spacing", "ls"],
+        "hex_size": ["hex_size"],
+        "channels": ["channels"],
+        "interfaces": ["interfaces"],
+        "memory_size": ["memory_size"],
+        "memory_type": ["memory_type"],
+        "brightness_mcd": ["brightness_mcd"],
         "description": ["description", "desc"],
         "value": ["value"],
     }.get(cf, [cf])
-    for key in candidates:
-        v = p.get(key)
-        if v not in (None, ""):
-            return v
+    for source in (q, p):
+        for key in candidates:
+            v = source.get(key)
+            if v not in (None, ""):
+                return v
     return None
 
 def _float_or_none(v):
@@ -421,6 +461,7 @@ class MatchingEngine:
         self.inventory = inventory_parts
         self.stop_event = stop_event
         self.config = config
+        self._parser_cfg = config if config is not None else _get_parser_cfg()
         self.ui_root = ui_root  # Tk root for UI progress callbacks (avoid tkinter._default_root import bugs)
         # Disk cache directory (relative to cwd by default)
         self.cache_dir = Path(cache_dir or ".npr_semantic_cache")
@@ -538,6 +579,34 @@ class MatchingEngine:
             if ENG_DEBUG:
                 print(f"[TRACE] failed to write: {e}")
 
+    def _gate_debug_path(self):
+        return self.cache_dir / "parsed_gate_debug.txt"
+
+    def _gate_debug_reset(self) -> None:
+        try:
+            p = self._gate_debug_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    def _gate_debug_write(self, text_line: str = "") -> None:
+        if not ENG_DEBUG:
+            return
+        try:
+            p = self._gate_debug_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if not hasattr(self, "_gate_debug_lock"):
+                self._gate_debug_lock = threading.Lock()
+            with self._gate_debug_lock:
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(str(text_line))
+                    if not str(text_line).endswith("\n"):
+                        f.write("\n")
+        except Exception as e:
+            if ENG_DEBUG:
+                print(f"[GATE-DEBUG] failed to write: {e}")
 
     def trace_reset(self) -> None:
         """Call this before a run if you want a clean file."""
@@ -1039,6 +1108,11 @@ class MatchingEngine:
                 self._family_filter_detail = []
             except Exception:
                 pass
+            try:
+                self._gate_debug_reset()
+                self._gate_debug_write(f"=== MATCH RUN START {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+            except Exception:
+                pass
             self._run_started = True
             self._exports_written = False
 
@@ -1476,64 +1550,154 @@ class MatchingEngine:
         except Exception:
             return None
 
+    def _get_matching_rules_for_type(self, type_name: str) -> List[Dict[str, Any]]:
+        return _component_matching_rules(type_name)
+
+    def _global_quant_fields(self) -> List[tuple[str, str]]:
+        return [
+            ("resistance", "eq"),
+            ("capacitance", "eq"),
+            ("inductance", "eq"),
+            ("voltage", "eq"),
+            ("voltage_kind", "eq"),
+            ("current", "eq"),
+            ("power", "eq"),
+            ("tolerance", "eq"),
+            ("package", "eq"),
+            ("mount", "eq"),
+            ("pins", "eq"),
+            ("pitch", "eq"),
+            ("frequency", "eq"),
+            ("temperature", "eq"),
+            ("length", "eq"),
+            ("width", "eq"),
+            ("height", "eq"),
+            ("diameter", "eq"),
+            ("lead_spacing", "eq"),
+            ("hex_size", "eq"),
+            ("channels", "eq"),
+            ("interfaces", "eq"),
+            ("memory_size", "eq"),
+            ("memory_type", "eq"),
+            ("brightness_mcd", "eq"),
+        ]
+
+    def _build_global_parsed_rules(self, npr_p: Dict[str, Any], inv_p: Dict[str, Any]) -> List[Dict[str, Any]]:
+        left = npr_p or {}
+        right = inv_p or {}
+        rules: List[Dict[str, Any]] = []
+        for field, mode in self._global_quant_fields():
+            lv = _parsed_value_by_field(left, field)
+            rv = _parsed_value_by_field(right, field)
+            if lv in (None, "") or rv in (None, ""):
+                continue
+            rules.append({"field": field, "mode": mode, "source": "quantitative_specs"})
+        return rules
+
+    def _coerce_rule_values(self, field: str, left: Any, right: Any) -> tuple[Any, Any, bool]:
+        cf = _canonical_field_alias(field)
+        if cf == "package":
+            return self._norm_pkg(str(left)), self._norm_pkg(str(right)), True
+        if cf in {"mount", "memory_type", "voltage_kind"}:
+            return _str_norm(left), _str_norm(right), True
+        if cf in {"resistance", "capacitance", "inductance", "voltage", "current", "power", "tolerance", "pins", "pitch", "frequency", "temperature", "length", "width", "height", "diameter", "lead_spacing", "hex_size", "channels", "interfaces", "memory_size", "brightness_mcd"}:
+            lv = _float_or_none(left)
+            rv = _float_or_none(right)
+            return lv, rv, lv is not None and rv is not None
+        return _str_norm(left), _str_norm(right), True
+
+    def _passes_rule(self, field: str, mode: str, left: Any, right: Any) -> bool:
+        lv, rv, ok = self._coerce_rule_values(field, left, right)
+        if not ok:
+            return True
+        mode = str(mode or "eq").strip().lower()
+        if mode == "eq":
+            return lv == rv
+        if mode in {"gte", "min"}:
+            return rv >= lv
+        if mode in {"lte", "max"}:
+            return rv <= lv
+        return True
+
     def _apply_parsed_gates(self, npr: NPRPart, candidates: List[Any]) -> List[Any]:
-        """Apply YAML-driven parsed-field gates over the semantic candidate list."""
+        """Apply YAML type rules plus global quantitative hardgates over the semantic shortlist."""
         npr_p = self._safe_get_parsed(npr)
         n_type = self._ptype(npr_p)
-        rules = _component_matching_rules(n_type)
-        if not rules:
-            return list(candidates or [])
+        bom_id = (getattr(npr, "partnum", None) or getattr(npr, "npr_item", None) or "").strip()
+        bom_mpn = (getattr(npr, "mfgpn", None) or "").strip()
+        bom_desc = (getattr(npr, "description", None) or getattr(npr, "desc", None) or "").strip()
+
+        try:
+            self._gate_debug_write("=" * 120)
+            self._gate_debug_write(f"[BOM] part={bom_id} mpn={bom_mpn}")
+            self._gate_debug_write(f"[BOM] desc={bom_desc}")
+            self._gate_debug_write(f"[BOM] parsed_type={n_type}")
+            self._gate_debug_write(f"[BOM] parsed={json.dumps(npr_p, ensure_ascii=False, sort_keys=True, default=str)}")
+            self._gate_debug_write(f"[BOM] candidate_count_in={len(candidates or [])}")
+        except Exception:
+            pass
 
         out = []
-        for inv in (candidates or []):
+        for idx, inv in enumerate((candidates or []), start=1):
             ip = self._get_or_parse_inv_fields(inv)
             i_type = self._ptype(ip)
-            if n_type != "OTHER" and i_type not in ("", "OTHER", n_type):
-                continue
+
+            type_rules = self._get_matching_rules_for_type(n_type)
+            global_rules = self._build_global_parsed_rules(npr_p, ip)
+            rules = list(type_rules or []) + [r for r in global_rules if r not in (type_rules or [])]
+
+            inv_item = self._inv_item(inv)
+            inv_desc = self._inv_desc(inv)
+            inv_mpn = (getattr(inv, "vendoritem", None) or "").strip()
+            debug_lines = [
+                f"[CAND {idx}] item={inv_item} mpn={inv_mpn}",
+                f"[CAND {idx}] desc={inv_desc}",
+                f"[CAND {idx}] parsed_type={i_type}",
+                f"[CAND {idx}] parsed={json.dumps(ip, ensure_ascii=False, sort_keys=True, default=str)}",
+            ]
 
             keep = True
+            if type_rules and n_type != "OTHER" and i_type not in ("", "OTHER", n_type):
+                keep = False
+                debug_lines.append(f"[CAND {idx}] FAIL type_mismatch bom_type={n_type} inv_type={i_type}")
+
             for rule in rules:
+                if not keep:
+                    break
                 field = str(rule.get("field", "") or "").strip()
-                mode = str(rule.get("mode", "") or "").strip().lower()
+                mode = str(rule.get("mode", "") or "eq").strip().lower()
                 if not field or mode in {"hybrid", "semantic", "text", "range"}:
                     continue
 
                 left = _parsed_value_by_field(npr_p, field)
                 right = _parsed_value_by_field(ip, field)
                 if left in (None, "") or right in (None, ""):
+                    debug_lines.append(
+                        f"[CAND {idx}] SKIP field={field} mode={mode} bom={left!r} inv={right!r} reason=missing_side"
+                    )
                     continue
 
-                cf = _canonical_field_alias(field)
-                if cf == "package":
-                    lv = self._norm_pkg(str(left))
-                    rv = self._norm_pkg(str(right))
-                elif cf == "mount":
-                    lv = _str_norm(left)
-                    rv = _str_norm(right)
-                elif cf in {"resistance", "capacitance", "inductance", "voltage", "current", "power", "tolerance", "pins", "pitch", "frequency"}:
-                    lv = _float_or_none(left)
-                    rv = _float_or_none(right)
-                    if lv is None or rv is None:
-                        continue
-                else:
-                    lv = _str_norm(left)
-                    rv = _str_norm(right)
+                passed = self._passes_rule(field, mode, left, right)
+                debug_lines.append(
+                    f"[CAND {idx}] CHECK field={field} mode={mode} bom={left!r} inv={right!r} result={'PASS' if passed else 'FAIL'}"
+                )
+                if not passed:
+                    keep = False
 
-                if mode == "eq":
-                    if lv != rv:
-                        keep = False
-                        break
-                elif mode in {"gte", "min"}:
-                    if rv < lv:
-                        keep = False
-                        break
-                elif mode in {"lte", "max"}:
-                    if rv > lv:
-                        keep = False
-                        break
+            debug_lines.append(f"[CAND {idx}] FINAL={'KEEP' if keep else 'DROP'}")
+            try:
+                for line in debug_lines:
+                    self._gate_debug_write(line)
+            except Exception:
+                pass
 
             if keep:
                 out.append(inv)
+
+        try:
+            self._gate_debug_write(f"[BOM] candidate_count_out={len(out)}")
+        except Exception:
+            pass
         return out
 
     def _fuzzy_fallback_candidates(self, query_desc: str, top_k: int) -> List[tuple[int, float]]:
@@ -2633,7 +2797,17 @@ class MatchingEngine:
         # Stage 4: deterministic gates (no confidence logic)
         # -----------------------------
         gated = self._apply_parsed_gates(npr, candidates)
-        final_pool = gated if gated else candidates
+        final_pool = gated
+        try:
+            part_label = (getattr(npr, "partnum", None) or getattr(npr, "npr_item", None) or "").strip()
+            fallback_used = bool((not gated) and bool(candidates))
+            self._gate_debug_write(
+                f"[GATE-SUMMARY] part={part_label} gated_count={len(gated)} candidate_count={len(candidates)} final_pool_count_pretrim={len(final_pool)} fallback_to_ungated={'YES' if fallback_used else 'NO'}"
+            )
+            if fallback_used:
+                self._gate_debug_write("[GATE-SUMMARY] WARNING: gated list was empty, engine fell back to ungated candidates.")
+        except Exception:
+            pass
 
         final_pool = sorted(final_pool, key=lambda x: float(getattr(x, "_pc_score", 0.0) or 0.0), reverse=True)
         final_pool = final_pool[:int(ENG_RETURN_K)]

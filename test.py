@@ -1,2 +1,0 @@
-L = "PCB SFTECH HY100027011 51.562x25.4mm FR-4 4L ENIG 1.6mm THK"
-print(len(L))

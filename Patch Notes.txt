@@ -31,14 +31,7 @@ Patch notes V3:
 	
 
 Patch notes V3.1:
-1) Reintegration of Parsing engine 
-	One of the bigger concerns for the program has been introducing a proper parsing engine which can handle CNS parsing, Inentory parsing, and quantity value recognition for matching engine hydration.
-	For no the porgrm operates off simple regex snipits that allowed me to do quick and easy parseing. For he CNS parsing and parttype matching this is true. 
-	The main purpose of the parsing engine reitgration patch is to hold and imporve upon those snipits into one locolaized area, and to provide the foundation for hardgateing the systems wuanititative values.
-	Another purpose of th aparsing engine is to give the program a means to start excessing the new compnents schema listings that I am building, where I describe the specs of each compents category for the inventory normilaization.
-	Right now the only part type matching foundation is a yaml file filled with confidenc levels and the most common word types per compnent category from the CNS that we have. its primitive but works for now and is company specifc 
-	and for the most part only useful for the inventory mantching rather than a standalone quanitiative parsing syetm, which the parsing engine stands to solve. 
-	
+1) Reintegration of Parsing engine (in progress)
 2) TODO: patched the ui cards to stop stretchingot the size of the grid they were instantiated into. (attempted)
 3) Reintroduced the Loading Bar under the CTTK library instead of tk. Now loads for th emaster inventroy file and the ERP inventory file.
 4) plans to remove CNS parsing at startup.
@@ -46,3 +39,11 @@ Patch notes V3.1:
 	A) Splade is hashed like the embedded semantic cache and saved into the database for quick edititng retrival and acess. no loger goes over entire inventory per run. Cut run time by 10 minutes every change in the master or erp.
 6) Introducing New NPR logic and exporting logic for approvals, substitutes, and existences.
 7) Start of mapping of external alternates into the program. 
+
+Patch notes V3.2
+1) Added formatting and re adjusted rulings to the NPR, BOM, and approval sheet logic from provided UI input. 
+2) Re-integration of parsing engine core and quantitative value filtering post matching.
+3) adjusting displayed infromation and fixes
+	A) fixed an issue with population of right hand panel informaiton not being populated with a different selcted MFGPN slected under a selcted inventory PN.
+	B) Added all pertitent information form the two extracts to the right hand panel
+4) added copy paste row. column, cell functionality to upper panel 

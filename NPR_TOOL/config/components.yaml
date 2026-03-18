@@ -1,95 +1,3 @@
-
-## =========================================================
-## COMPONENT TYPES
-## =========================================================
-## This defines WHAT exists in the system.
-## No code changes are required to add a new type.
-#components:
-#  RES:
-#    enabled: true
-#    detect_keywords:
-#      - RES
-#      - RESISTOR
-#      - OHM
-#      - Ω
-#
-#    parsing:
-#      value: resistance_ohms
-#      tolerance: percent
-#      package: standard
-#      mount: auto
-#
-#    matching:
-#      confidence_scale: 1.0
-#      rules:
-#        - field: value
-#          mode: eq
-#        - field: tolerance
-#          mode: max        # inventory <= requested
-#        - field: package
-#          mode: eq
-#        - field: mount
-#          mode: eq
-#
-#  CAP:
-#    enabled: true
-#    detect_keywords:
-#      - CAP
-#      - CAPACITOR
-#      - UF
-#      - NF
-#      - PF
-#      - FARAD
-#
-#    parsing:
-#      value: capacitance_farads
-#      voltage: volts
-#      tolerance: percent
-#      dielectric: keyword
-#      package: standard
-#      mount: auto
-#
-#    matching:
-#      confidence_scale: 1.0
-#      rules:
-#        - field: value
-#          mode: eq
-#        - field: voltage
-#          mode: eq        # inventory = requested
-#        - field: tolerance
-#          mode: max
-#        - field: dielectric
-#          mode: eq
-#        - field: package
-#          mode: eq
-#        - field: mount
-#          mode: eq
-#
-#  LED:
-#    enabled: true
-#    detect_keywords:
-#      - LED
-#
-#    parsing:
-#      color: keyword
-#      brightness_mcd: numeric
-#      wavelength_nm: numeric
-#      package: standard
-#      mount: auto
-#
-#    matching:
-#      confidence_scale: 0.9
-#      rules:
-#        - field: color
-#          mode: eq
-#        - field: brightness_mcd
-#          mode: range
-#          tolerance: 0.20
-#        - field: package
-#          mode: eq
-#        - field: mount
-#          mode: eq
-
 version: 1
 components:
   01_MISC_ASEMBLIES:
@@ -205,6 +113,8 @@ components:
     - TMTR
     - OHM
     - THERMISTOR
+    - MOV
+    - Varistor
     parsing:
       resistance: resistance_ohms
       percent: percent
@@ -241,6 +151,7 @@ components:
   08_CAPS_FIXED_NOT_CER_MIC_EL:
     enabled: true
     detect_keywords:
+    - EL
     - CAPS
     - CAP
     - MPE
@@ -266,7 +177,6 @@ components:
   09_SOCKET_FEMALE_CONNECTORS:
     enabled: true
     detect_keywords:
-    - CONN
     - FPC
     - ROW
     - SCKT
@@ -274,7 +184,6 @@ components:
     - FEMALE
     - USB
     - SOCKET
-    - VERT
     parsing:
       pins: pins
       pitch: pitch
@@ -445,13 +354,14 @@ components:
   21_CAPACITORS_CER_OR_MIC:
     enabled: true
     detect_keywords:
-    - RADIAL
     - MMD
     - CAPACITORS
     - CAP
     - MIC
     - MONO
     - CER
+    - Ceramic
+    - MONOLITHIC
     - MMLS
     - DISK
     parsing:
@@ -473,8 +383,8 @@ components:
   23_CAPACITORS_EL_OR_TANT:
     enabled: true
     detect_keywords:
-    - RADIAL
     - SMT
+    - EL
     - MMD
     - CAPACITORS
     - TANT
@@ -502,18 +412,17 @@ components:
   24_COILS_AND_CHOKES:
     enabled: true
     detect_keywords:
-    - SMT
-    - SMD
     - POWER
     - MHZ
     - AND
     - CHOKE
-    - ROHS
-    - OHM
-    - FIXED
     - IND
     - MOHM
     - CHOKES
+    - CHK
+    - FB
+    - IND
+    - FIXED
     parsing:
       description: text
     matching:
@@ -577,14 +486,14 @@ components:
     detect_keywords:
     - PLUGS
     - SHROUD
-    - DUAL
-    - CONN
+    - PLUG
     - TERM
     - ROW
     - BLOCK
     - SERIES
     - HEADER
     - VERT
+    - MATE-N-LOCK
     parsing:
       pins: pins
       pitch: pitch
@@ -941,18 +850,39 @@ components:
   51_IC_RC_NETWORK_COMP_MODULES:
     enabled: true
     detect_keywords:
-    - AMP
-    - SOIC
-    - TQFP
-    - DUAL
     - FLASH
-    - SOT
     - VREG
     - BIT
-    - ROHS
     - MODULES
     - NETWORK
     - REG
+    - IC
+    - DC/DC
+    - Supervisor
+    - Meter
+    - Memory
+    - AC/DC
+    - OPTO
+    - UC
+    - MCU
+    - ISO
+    - DGT
+    - FLASH
+    - SDRAM
+    - DAC
+    - XCVR
+    - ADC
+    - RF
+    - WIFI
+    - eMMC
+    - SENSE
+    - TRANSLTR
+    - Driver
+    - FRAM
+    - OPTOISOLATOR
+    - SCHMITT
+    - OVERCURRENT
+    - MODULE
     parsing:
       description: text
     matching:
@@ -1442,33 +1372,21 @@ components:
       - field: description
         mode: hybrid
         threshold: 0.75
-
-
-
-# =========================================================
-# MATCH TIERS (GLOBAL)
-# =========================================================
 tiers:
   EXACT_MFG_PN:
-    confidence: 1.00
-
+    confidence: 1.0
   PREFIX_FAMILY:
-    confidence: 0.60
-
+    confidence: 0.6
   PARTIAL_ITEMNUM:
-    confidence: 0.90
-
+    confidence: 0.9
   SUBSTITUTE:
     confidence: 0.95
-
   PARSED_MATCH:
-    confidence: 0.80
-
+    confidence: 0.8
   API_ASSISTED:
     confidence: 0.55
-
   NO_MATCH:
-    confidence: 0.00
+    confidence: 0.0
     MatchType.EXACT_MFG_PN: 1.00,
     MatchType.PARTIAL_ITEMNUM: 0.90,
     MatchType.PREFIX_FAMILY: 0.60,
@@ -1476,3 +1394,148 @@ tiers:
     MatchType.PARSED_MATCH: 0.80,
     MatchType.API_ASSISTED: 0.50,
     MatchType.NO_MATCH: 0.00,
+global_specs:
+  enabled: true
+  fields:
+    voltage:
+      extractor: voltage
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: V
+    voltage_kind:
+      extractor: voltage_kind
+      kind: categorical
+      hardgate: true
+      mode: eq
+    current:
+      extractor: current
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: A
+    power:
+      extractor: power
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: W
+    tolerance:
+      extractor: tolerance
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: '%'
+    temperature:
+      extractor: temperature
+      kind: numeric
+      hardgate: true
+      mode: min
+      units: C
+    frequency:
+      extractor: frequency
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: HZ
+    resistance:
+      extractor: resistance
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: OHM
+    capacitance:
+      extractor: capacitance
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: F
+    inductance:
+      extractor: inductance
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: H
+    package:
+      extractor: package
+      kind: categorical
+      hardgate: true
+      mode: eq
+    mount:
+      extractor: mount
+      kind: categorical
+      hardgate: true
+      mode: eq
+    pins:
+      extractor: pins
+      kind: numeric
+      hardgate: true
+      mode: eq
+    pitch:
+      extractor: pitch
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: MM
+    length:
+      extractor: length
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: MM
+    width:
+      extractor: width
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: MM
+    height:
+      extractor: height
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: MM
+    diameter:
+      extractor: diameter
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: MM
+    lead_spacing:
+      extractor: lead_spacing
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: MM
+    hex_size:
+      extractor: hex_size
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: IN
+    channels:
+      extractor: channels
+      kind: numeric
+      hardgate: true
+      mode: eq
+    interfaces:
+      extractor: interfaces
+      kind: numeric
+      hardgate: true
+      mode: eq
+    memory_size:
+      extractor: memory_size
+      kind: numeric
+      hardgate: true
+      mode: eq
+    memory_type:
+      extractor: memory_type
+      kind: categorical
+      hardgate: true
+      mode: eq
+    brightness_mcd:
+      extractor: brightness_mcd
+      kind: numeric
+      hardgate: true
+      mode: eq
+      units: MCD
