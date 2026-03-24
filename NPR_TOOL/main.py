@@ -3,8 +3,8 @@ import tkinter as tk
 import os
 from pathlib import Path
 
-from .NEW_decision_controller import DecisionController, ControllerConfig
-from .NEW_UI import DecisionWorkspaceCTK
+from .decision_controller import DecisionController, ControllerConfig
+from .UI import DecisionWorkspaceCTK
 import customtkinter as ctk
 import tkinter as tk
 

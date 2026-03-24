@@ -161,6 +161,13 @@ class WorkspaceRepo:
                 args,
             )
 
+    def touch(self, workspace_id: str) -> None:
+        with _DB_LOCK, self.conn:
+            self.conn.execute(
+                "UPDATE workspace SET updated_at = ? WHERE workspace_id = ?;",
+                (_now_iso(), workspace_id),
+            )
+
 
 # =============================================================================
 # BomRepo
@@ -240,6 +247,39 @@ class BomRepo:
                         str(row.get("supplier", "") or ""),
                     ),
                 )
+
+    def list_inputs(self, workspace_id: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM bom_line_input
+            WHERE workspace_id = ?
+            ORDER BY input_line_id ASC;
+            """,
+            (workspace_id,),
+        ).fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["raw_json"] = json_loads(d.get("raw_json"), default={})
+            out.append(d)
+        return out
+
+    def get_input(self, workspace_id: str, input_line_id: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM bom_line_input
+            WHERE workspace_id = ? AND input_line_id = ?;
+            """,
+            (workspace_id, int(input_line_id)),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["raw_json"] = json_loads(d.get("raw_json"), default={})
+        return d
 
     def bootstrap_state_from_inputs(
         self,
@@ -1039,6 +1079,271 @@ class MatchAltRepo:
             out.append(d)
         return out
 
+
+# =============================================================================
+# DecisionNodeRepo / DecisionAltRepo
+# =============================================================================
+class DecisionNodeRepo:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def save_node(
+        self,
+        workspace_id: str,
+        node: Dict[str, Any],
+        *,
+        created_at: Optional[str] = None,
+    ) -> None:
+        created_at = created_at or _now_iso()
+        now = _now_iso()
+        with _DB_LOCK, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO decision_node (
+                    workspace_id, node_id, line_id,
+                    base_type, bom_uid, bom_mpn, description,
+                    internal_part_number, assigned_part_number, inventory_mpn, preferred_inventory_mfgpn, bom_section,
+                    match_type, confidence,
+                    status, locked, needs_approval,
+                    focused_alt_id, exclude_customer_part_number_in_npr,
+                    notes, explain_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workspace_id, node_id) DO UPDATE SET
+                    line_id=excluded.line_id,
+                    base_type=excluded.base_type,
+                    bom_uid=excluded.bom_uid,
+                    bom_mpn=excluded.bom_mpn,
+                    description=excluded.description,
+                    internal_part_number=excluded.internal_part_number,
+                    assigned_part_number=excluded.assigned_part_number,
+                    inventory_mpn=excluded.inventory_mpn,
+                    preferred_inventory_mfgpn=excluded.preferred_inventory_mfgpn,
+                    bom_section=excluded.bom_section,
+                    match_type=excluded.match_type,
+                    confidence=excluded.confidence,
+                    status=excluded.status,
+                    locked=excluded.locked,
+                    needs_approval=excluded.needs_approval,
+                    focused_alt_id=excluded.focused_alt_id,
+                    exclude_customer_part_number_in_npr=excluded.exclude_customer_part_number_in_npr,
+                    notes=excluded.notes,
+                    explain_json=excluded.explain_json,
+                    updated_at=excluded.updated_at;
+                """,
+                (
+                    workspace_id,
+                    str(node.get("node_id", "") or ""),
+                    int(node.get("line_id", 0) or 0),
+                    str(node.get("base_type", "") or ""),
+                    str(node.get("bom_uid", "") or ""),
+                    str(node.get("bom_mpn", "") or ""),
+                    str(node.get("description", "") or ""),
+                    str(node.get("internal_part_number", "") or ""),
+                    str(node.get("assigned_part_number", "") or ""),
+                    str(node.get("inventory_mpn", "") or ""),
+                    str(node.get("preferred_inventory_mfgpn", "") or ""),
+                    str(node.get("bom_section", "SURFACE MOUNT") or "SURFACE MOUNT"),
+                    str(node.get("match_type", "") or ""),
+                    float(node.get("confidence", 0.0) or 0.0),
+                    str(node.get("status", "NEEDS_DECISION") or "NEEDS_DECISION"),
+                    int(node.get("locked", 0) or 0),
+                    int(node.get("needs_approval", 0) or 0),
+                    str(node.get("focused_alt_id", "") or ""),
+                    int(node.get("exclude_customer_part_number_in_npr", 0) or 0),
+                    str(node.get("notes", "") or ""),
+                    json_dumps(node.get("explain_json", {}) or node.get("explain", {}) or {}),
+                    created_at,
+                    now,
+                ),
+            )
+
+    def save_nodes(self, workspace_id: str, nodes: Sequence[Dict[str, Any]]) -> None:
+        for node in (nodes or []):
+            self.save_node(workspace_id, node)
+
+    def get_node(self, workspace_id: str, node_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM decision_node
+            WHERE workspace_id = ? AND node_id = ?;
+            """,
+            (workspace_id, str(node_id or "")),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["explain_json"] = json_loads(d.get("explain_json"), default={})
+        return d
+
+    def list_nodes(self, workspace_id: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM decision_node
+            WHERE workspace_id = ?
+            ORDER BY line_id ASC, node_id ASC;
+            """,
+            (workspace_id,),
+        ).fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["explain_json"] = json_loads(d.get("explain_json"), default={})
+            out.append(d)
+        return out
+
+    def delete_workspace_nodes(self, workspace_id: str) -> None:
+        with _DB_LOCK, self.conn:
+            self.conn.execute(
+                "DELETE FROM decision_node WHERE workspace_id = ?;",
+                (workspace_id,),
+            )
+
+
+class DecisionAltRepo:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def save_node_alternates(
+        self,
+        workspace_id: str,
+        node_id: str,
+        alts: Sequence[Dict[str, Any]],
+        *,
+        created_at: Optional[str] = None,
+    ) -> None:
+        created_at = created_at or _now_iso()
+        now = _now_iso()
+        with _DB_LOCK, self.conn:
+            self.conn.execute(
+                "DELETE FROM decision_alt WHERE workspace_id = ? AND node_id = ?;",
+                (workspace_id, str(node_id or "")),
+            )
+            for alt in (alts or []):
+                self.conn.execute(
+                    """
+                    INSERT INTO decision_alt (
+                        workspace_id, node_id, alt_id,
+                        source,
+                        manufacturer, manufacturer_part_number, internal_part_number,
+                        description,
+                        value, package, tolerance, voltage, wattage,
+                        stock, unit_cost, supplier,
+                        confidence, relationship, matched_mpn,
+                        selected, rejected,
+                        meta_json, raw_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        workspace_id,
+                        str(node_id or ""),
+                        str(alt.get("alt_id", "") or ""),
+                        str(alt.get("source", "inventory") or "inventory"),
+                        str(alt.get("manufacturer", "") or ""),
+                        str(alt.get("manufacturer_part_number", "") or ""),
+                        str(alt.get("internal_part_number", "") or ""),
+                        str(alt.get("description", "") or ""),
+                        str(alt.get("value", "") or ""),
+                        str(alt.get("package", "") or ""),
+                        str(alt.get("tolerance", "") or ""),
+                        str(alt.get("voltage", "") or ""),
+                        str(alt.get("wattage", "") or ""),
+                        int(alt.get("stock", 0) or 0),
+                        _as_float_or_none(alt.get("unit_cost")),
+                        str(alt.get("supplier", "") or ""),
+                        float(alt.get("confidence", 0.0) or 0.0),
+                        str(alt.get("relationship", "") or ""),
+                        str(alt.get("matched_mpn", "") or ""),
+                        int(alt.get("selected", 0) or 0),
+                        int(alt.get("rejected", 0) or 0),
+                        json_dumps(alt.get("meta_json", {}) or alt.get("meta", {}) or {}),
+                        json_dumps(alt.get("raw_json", {}) or alt.get("raw", {}) or {}),
+                        created_at,
+                        now,
+                    ),
+                )
+
+    def save_alternate(
+        self,
+        workspace_id: str,
+        node_id: str,
+        alt: Dict[str, Any],
+        *,
+        created_at: Optional[str] = None,
+    ) -> None:
+        existing = self.list_node_alternates(workspace_id, node_id, include_rejected=True)
+        existing = [a for a in existing if str(a.get("alt_id", "")) != str(alt.get("alt_id", ""))]
+        existing.append(dict(alt))
+        self.save_node_alternates(workspace_id, node_id, existing, created_at=created_at)
+
+    def list_node_alternates(
+        self,
+        workspace_id: str,
+        node_id: str,
+        *,
+        include_rejected: bool = True,
+    ) -> List[Dict[str, Any]]:
+        q = """
+            SELECT *
+            FROM decision_alt
+            WHERE workspace_id = ? AND node_id = ?
+        """
+        args: List[Any] = [workspace_id, str(node_id or "")]
+        if not include_rejected:
+            q += " AND rejected = 0"
+        q += " ORDER BY selected DESC, rejected ASC, confidence DESC, alt_id ASC;"
+        rows = self.conn.execute(q, tuple(args)).fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["meta_json"] = json_loads(d.get("meta_json"), default={})
+            d["raw_json"] = json_loads(d.get("raw_json"), default={})
+            out.append(d)
+        return out
+
+    def list_workspace_alternates(
+        self,
+        workspace_id: str,
+        *,
+        include_rejected: bool = True,
+    ) -> List[Dict[str, Any]]:
+        q = """
+            SELECT *
+            FROM decision_alt
+            WHERE workspace_id = ?
+        """
+        args: List[Any] = [workspace_id]
+        if not include_rejected:
+            q += " AND rejected = 0"
+        q += " ORDER BY node_id ASC, selected DESC, rejected ASC, confidence DESC, alt_id ASC;"
+        rows = self.conn.execute(q, tuple(args)).fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["meta_json"] = json_loads(d.get("meta_json"), default={})
+            d["raw_json"] = json_loads(d.get("raw_json"), default={})
+            out.append(d)
+        return out
+
+    def delete_node_alternates(self, workspace_id: str, node_id: str) -> None:
+        with _DB_LOCK, self.conn:
+            self.conn.execute(
+                "DELETE FROM decision_alt WHERE workspace_id = ? AND node_id = ?;",
+                (workspace_id, str(node_id or "")),
+            )
+
+    def delete_workspace_alternates(self, workspace_id: str) -> None:
+        with _DB_LOCK, self.conn:
+            self.conn.execute(
+                "DELETE FROM decision_alt WHERE workspace_id = ?;",
+                (workspace_id,),
+            )
 
 # =============================================================================
 # SpladeCacheRepo

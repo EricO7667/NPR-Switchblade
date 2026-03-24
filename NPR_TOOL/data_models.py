@@ -363,12 +363,193 @@ class Alternate:
     raw: Optional[object] = None
 
     # ---- Extra extensibility ----
-    meta: Dict = field(default_factory=dict)
+    meta: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def new_id(prefix: str = "ALT") -> str:
         return f"{prefix}-{uuid.uuid4().hex[:10]}"
-    
+
+
+class CardSection(str, Enum):
+    """Stable UI buckets for rendering card groups without inferring from widgets."""
+    INTERNAL_MATCHES = "INTERNAL_MATCHES"
+    EXTERNAL_ALTERNATES = "EXTERNAL_ALTERNATES"
+    REJECTED = "REJECTED"
+
+
+@dataclass
+class CardState:
+    """Mutable UI-facing workflow state for a rendered card."""
+    selected: bool = False
+    rejected: bool = False
+    pinned: bool = False
+    locked: bool = False
+    visible: bool = True
+    actionable: bool = True
+
+
+@dataclass
+class CardDisplay:
+    """Read-only presentation snapshot derived from the backing Alternate."""
+    title: str = ""
+    subtitle: str = ""
+    description: str = ""
+    source_label: str = ""
+    stock_label: str = "-"
+    confidence_ratio: float = 0.0
+    confidence_text: str = "0%"
+    border_role: str = "default"
+    badges: List[str] = field(default_factory=list)
+    mfgpn_count: int = 0
+
+
+@dataclass
+class DecisionCard:
+    """
+    UI/state-driven card object.
+
+    This becomes the owned representation of a rendered card. The Alternate remains
+    the export/workflow object, while DecisionCard is the explicit renderable state.
+    """
+
+    card_id: str
+    node_id: str
+    alt_id: str = ""
+    section: CardSection = CardSection.INTERNAL_MATCHES
+    source: str = ""
+    is_inventory: bool = False
+
+    company_part_number: str = ""
+    manufacturer_part_number: str = ""
+    manufacturer: str = ""
+    relationship: str = ""
+
+    state: CardState = field(default_factory=CardState)
+    display: CardDisplay = field(default_factory=CardDisplay)
+
+    alternate: Optional[Alternate] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_rejected(self) -> bool:
+        return bool(self.state.rejected)
+
+    @property
+    def is_selected(self) -> bool:
+        return bool(self.state.selected)
+
+    @property
+    def is_pinned(self) -> bool:
+        return bool(self.state.pinned)
+
+
+
+@dataclass
+class HeaderControlState:
+    """Mutable enable/disable state for the upper-panel controls."""
+    company_pn_editable: bool = False
+    apply_pn_enabled: bool = False
+    description_editable: bool = False
+    bom_section_editable: bool = False
+    approval_editable: bool = False
+    load_external_enabled: bool = False
+    mark_ready_enabled: bool = True
+    unmark_ready_enabled: bool = False
+    auto_reject_enabled: bool = True
+
+
+@dataclass
+class NodeHeaderState:
+    """
+    Controller-owned upper-panel state.
+
+    This object now supports both:
+      - committed node-backed values
+      - mutable UI draft values
+
+    The UI should render from this object rather than reconstructing header values
+    from selected alternates, scattered node fields, or widget text.
+    """
+
+    node_id: str
+    title_text: str = "Company PN: —"
+    subtitle_text: str = "BOM MPN: —"
+    status_text: str = ""
+
+    # Current mutable/UI-facing values
+    company_part_number: str = ""
+    suggested_company_part_number: str = ""
+    description_text: str = ""
+    bom_mpn: str = ""
+    bom_section: str = "SURFACE MOUNT"
+    include_approval: bool = False
+
+    # Committed node-backed values
+    committed_company_part_number: str = ""
+    committed_description_text: str = ""
+    committed_bom_section: str = "SURFACE MOUNT"
+    committed_include_approval: bool = False
+
+    # Dirty flags for staged edits
+    dirty_company_part_number: bool = False
+    dirty_description: bool = False
+    dirty_bom_section: bool = False
+    dirty_approval: bool = False
+
+    selected_alt_id: str = ""
+    selected_card_id: str = ""
+
+    has_selected_alt: bool = False
+    selected_is_internal: bool = False
+    all_rejected: bool = False
+    locked: bool = False
+    is_ready: bool = False
+
+    controls: HeaderControlState = field(default_factory=HeaderControlState)
+
+
+@dataclass
+class CardDetailState:
+    """
+    Controller-owned right-panel/detail-panel state for a node/card selection.
+
+    The specs panel should render strictly from this object rather than inferring
+    which alternate is being viewed from widget history or ad hoc UI logic.
+    """
+
+    node_id: str
+    card_id: str = ""
+    alt_id: str = ""
+    title_text: str = "Information"
+    specs: Dict[str, Any] = field(default_factory=dict)
+    export_mfgpn_options: List[str] = field(default_factory=list)
+    selected_export_mfgpn: str = ""
+    has_card: bool = False
+    is_inventory: bool = False
+
+@dataclass
+class CommittedExportState:
+    """Committed export-facing snapshot derived from a node's durable state."""
+
+    node_id: str
+    line_id: int = 0
+    company_part_number: str = ""
+    description_text: str = ""
+    bom_mpn: str = ""
+    bom_section: str = "SURFACE MOUNT"
+    bucket: str = "SURFACE MOUNT"
+    type_value: str = "SMD"
+    manufacturer_name: str = ""
+    manufacturer_part_number: str = ""
+    selected_alt_id: str = ""
+    selected_alt_source: str = ""
+    include_approval: bool = False
+    has_internal: bool = False
+    has_selected_external: bool = False
+    preferred_inventory_mfgpn: str = ""
+    exclude_customer_part_number_in_npr: bool = False
+    notes: str = ""
+
 
 class DecisionStatus(str, Enum):
     FULL_MATCH = "FULL_MATCH"
@@ -397,6 +578,11 @@ class DecisionNode:
 
     internal_part_number: str = ""       # EXISTS only
     inventory_mpn: str = ""              # EXISTS only
+    assigned_part_number: str = ""       # committed manual/company PN override
+    preferred_inventory_mfgpn: str = ""  # committed chosen MFG PN under the company PN
+    bom_section: str = "SURFACE MOUNT"   # committed export section/bucket
+    focused_alt_id: str = ""             # committed focused alternate identity for restore
+    exclude_customer_part_number_in_npr: bool = False  # external-only NPR option
 
     # ---- Matching metadata ----
     match_type: str = ""
@@ -404,6 +590,8 @@ class DecisionNode:
 
     # ---- Alternates ----
     alternates: List[Alternate] = field(default_factory=list)
+    cards: List[DecisionCard] = field(default_factory=list)
+    focused_card_id: str = ""
 
     # ---- Workflow state ----
     status: DecisionStatus = DecisionStatus.NEEDS_DECISION
@@ -420,6 +608,30 @@ class DecisionNode:
 
     def candidate_alternates(self) -> List[Alternate]:
         return [a for a in self.alternates if not a.rejected]
+
+    def set_cards(self, cards: List[DecisionCard]) -> None:
+        self.cards = list(cards or [])
+
+    def get_card(self, card_id: str) -> Optional[DecisionCard]:
+        for card in (self.cards or []):
+            if getattr(card, "card_id", "") == card_id:
+                return card
+        return None
+
+    def get_card_by_alt_id(self, alt_id: str) -> Optional[DecisionCard]:
+        for card in (self.cards or []):
+            if getattr(card, "alt_id", "") == alt_id:
+                return card
+        return None
+
+    def set_focused_card(self, card_id: str, alt_id: str = "") -> None:
+        self.focused_card_id = str(card_id or "").strip()
+        if alt_id:
+            self.focused_alt_id = str(alt_id or "").strip()
+
+    def clear_focused_card(self) -> None:
+        self.focused_card_id = ""
+        self.focused_alt_id = ""
 
     def has_selection(self) -> bool:
         return len(self.selected_alternates()) > 0

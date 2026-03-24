@@ -47,3 +47,18 @@ Patch notes V3.2
 	A) fixed an issue with population of right hand panel informaiton not being populated with a different selcted MFGPN slected under a selcted inventory PN.
 	B) Added all pertitent information form the two extracts to the right hand panel
 4) added copy paste row. column, cell functionality to upper panel 
+
+
+Patch notes V3.3:
+1) Changes to UI. 
+	A) Chnaged line driven archtecture to node driven archetecture. (states).
+2) Re-added previously removed Saving funcitlity to the database.
+3) Bug fixed BOM export funcitnilty. 
+4) added new button
+5) Re-implemented the open workspace and save workspace function.
+	A) UI states are saved on opening of a workspace.
+	B) rerun matching button validity to be tested, but ui states are untouched on run.
+6) implemented a debug for digikey APIing. 
+
+
+

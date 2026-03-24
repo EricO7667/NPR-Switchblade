@@ -130,9 +130,9 @@ import errno
 # =====================================================
 
 # Master toggles
-ENG_DEBUG = 1
-ENG_USE_DENSE = 1
-ENG_USE_SPARSE = 1
+ENG_DEBUG = 0
+ENG_USE_DENSE = 0
+ENG_USE_SPARSE = 0
 ENG_USE_RERANK = 1
 ENG_USE_FUZZY_FALLBACK = 1
 
