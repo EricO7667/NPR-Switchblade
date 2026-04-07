@@ -10,7 +10,7 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
-from .data_models import DecisionNode, DecisionStatus, Alternate, DecisionCard, CardSection, NodeHeaderState, CardDetailState
+from .data_models import DecisionNode, Alternate, DecisionCard, CardSection, NodeHeaderState, CardDetailState
 from typing import TYPE_CHECKING
 import time
 
@@ -19,8 +19,7 @@ if TYPE_CHECKING:
 
 
 class DecisionWorkspaceCTK:
-    """
-    Modern CTk UI shell that preserves the legacy behavior:
+    """:
       - controller/DB is truth
       - UI holds only current_node_id
       - renders always pull fresh state from controller
@@ -970,29 +969,6 @@ class DecisionWorkspaceCTK:
         self._render_detail_state(fresh, detail)
         return "break"
 
-    # LEGACY: retained during the card-model migration.
-    def _render_cards_legacy(self, node: DecisionNode):
-        for w in self.cards_scroll.winfo_children():
-            w.destroy()
-
-        prev_pinned = self._pinned_alt_id
-        alts = list(getattr(node, "alternates", []) or [])
-        valid_ids = {getattr(a, 'id', None) for a in alts}
-        self._pinned_alt_id = prev_pinned if prev_pinned in valid_ids else None
-
-        internal_active = [a for a in alts if (not getattr(a, "rejected", False)) and getattr(a, "source", "") == "inventory"]
-        external_active = [a for a in alts if (not getattr(a, "rejected", False)) and getattr(a, "source", "") != "inventory"]
-        rejected_all = [a for a in alts if getattr(a, "rejected", False)]
-
-        if not alts:
-            ctk.CTkLabel(self.cards_scroll, text="No alternates/candidates yet.", text_color=self.COLORS["text_dim"]).pack(anchor="w", padx=8, pady=8)
-            return
-
-        self._build_card_section_legacy(self.cards_scroll, f"Internal Matches ({len(internal_active)})", internal_active, node)
-        self._build_card_section_legacy(self.cards_scroll, f"External Alternates ({len(external_active)})", external_active, node)
-        if rejected_all:
-            self._build_card_section_legacy(self.cards_scroll, f"REJECTED ({len(rejected_all)})", rejected_all, node)
-
     def _render_specs_for_node(self, node: DecisionNode):
         try:
             detail = self.controller.get_node_detail_state(node.id, auto_focus=True)
@@ -1052,7 +1028,7 @@ class DecisionWorkspaceCTK:
         if bool(getattr(detail, "is_inventory", False)) and export_mfgpn_options:
             ctk.CTkLabel(
                 self.specs_scroll,
-                text='Choose export MFG PN',
+                text='Company Part MFG PNs',
                 text_color=self.COLORS['primary'],
                 font=ctk.CTkFont(size=11, weight='bold')
             ).pack(anchor='w', pady=(10, 4))
@@ -1441,34 +1417,6 @@ class DecisionWorkspaceCTK:
         except Exception as e:
             messagebox.showerror("Unreject Card Failed", str(e))
 
-    # Legacy alternate-driven handlers kept for fallback paths during migration.
-    def _add_alt(self, node: DecisionNode, alt: Alternate):
-        try:
-            card = self.controller.get_card_for_alt(node.id, getattr(alt, 'id', ''))
-            if card is None:
-                raise ValueError("Unable to resolve card for alternate.")
-            self._toggle_card_selection(node, card)
-        except Exception as e:
-            messagebox.showerror("Select Alternate Failed", str(e))
-
-    def _reject_alt(self, node: DecisionNode, alt: Alternate):
-        try:
-            card = self.controller.get_card_for_alt(node.id, getattr(alt, 'id', ''))
-            if card is None:
-                raise ValueError("Unable to resolve card for alternate.")
-            self._reject_card(node, card)
-        except Exception as e:
-            messagebox.showerror("Reject Alternate Failed", str(e))
-
-    def _unreject_alt(self, node: DecisionNode, alt: Alternate):
-        try:
-            card = self.controller.get_card_for_alt(node.id, getattr(alt, 'id', ''))
-            if card is None:
-                raise ValueError("Unable to resolve card for alternate.")
-            self._unreject_card(node, card)
-        except Exception as e:
-            messagebox.showerror("Unreject Alternate Failed", str(e))
-
     def _toggle_exclude_customer_pn_npr(self, node_id: str):
         try:
             self.controller.set_exclude_customer_part_number_in_npr(node_id, bool(self.exclude_customer_pn_npr_var.get()))
@@ -1735,6 +1683,8 @@ class DecisionWorkspaceCTK:
         except Exception:
             _apply()
 
+
+    # call the decsion controller functio to fill the database/ 
     def _load_inventory(self):
         path = filedialog.askopenfilename(
             title="Select Master Inventory Workbook",
@@ -1743,8 +1693,8 @@ class DecisionWorkspaceCTK:
         if not path:
             return
 
-        self._show_loading_popup("Loading Master Inventory", "Reading workbook...")
-        self._set_status("Loading master inventory...")
+        self._show_loading_popup("Loading Master Inventory", "Reading workbook.")
+        self._set_status("Loading master inventory.")
 
         def worker():
             try:
@@ -1761,7 +1711,7 @@ class DecisionWorkspaceCTK:
 
     def _on_inventory_loaded(self, count: int):
         self._close_loading_popup()
-        self._set_status(f"Loaded master inventory: {count} items")
+        self._set_status(f"Loaded master inventory into database: {count} company parts")
         self.current_node_id = None
         self.refresh_node_table()
         self._render_empty_state()
@@ -1770,6 +1720,7 @@ class DecisionWorkspaceCTK:
         self._close_loading_popup()
         messagebox.showerror("Load Master Inventory Failed", str(err))
 
+    # this is to load the ERP sheet inventory. 
     def _load_items_sheet(self):
         path = filedialog.askopenfilename(
             title="Select ERP Inventory Workbook",
@@ -1778,8 +1729,8 @@ class DecisionWorkspaceCTK:
         if not path:
             return
 
-        self._show_loading_popup("Loading ERP Inventory", "Reading workbook...")
-        self._set_status("Loading ERP inventory...")
+        self._show_loading_popup("Loading ERP Inventory", "Reading workbook.")
+        self._set_status("Loading ERP inventory.")
 
         def worker():
             try:
@@ -1796,7 +1747,7 @@ class DecisionWorkspaceCTK:
 
     def _on_items_inventory_loaded(self, count: int):
         self._close_loading_popup()
-        self._set_status(f"Loaded ERP inventory rows: {count}")
+        self._set_status(f"Loaded ERP inventory into database: {count} ERP rows")
         self.current_node_id = None
         self.refresh_node_table()
         self._render_empty_state()
@@ -1812,16 +1763,36 @@ class DecisionWorkspaceCTK:
         )
         if not path:
             return
-        try:
-            count = self.controller.load_npr(path)
-            self.current_node_id = None
-            self._focused_card_id = None
-            self._pinned_alt_id = None
-            self.refresh_node_table()
-            self._render_empty_state()
-            self._set_status(f"Loaded BOM lines: {count}")
-        except Exception as e:
-            messagebox.showerror("Load BOM Failed", str(e))
+
+        self._show_loading_popup("Loading BOM", "Reading workbook.")
+        self._set_status("Loading BOM.")
+
+        def worker():
+            try:
+                count = self.controller.load_npr(
+                    path,
+                    progress_cb=self._loading_progress_callback,
+                    phase_cb=self._loading_phase_callback,
+                )
+                self.root.after(0, lambda: self._on_bom_loaded(count))
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): self._on_bom_load_failed(err))
+
+        threading.Thread(target=worker, daemon=True, name="load-bom").start()
+
+    def _on_bom_loaded(self, count: int):
+        self._close_loading_popup()
+        self.current_node_id = None
+        self._focused_card_id = None
+        self._pinned_alt_id = None
+        self.refresh_node_table()
+        self._render_empty_state()
+        self._set_status(f"Loaded BOM into database: {count} lines")
+
+    def _on_bom_load_failed(self, err: str):
+        self._close_loading_popup()
+        messagebox.showerror("Load BOM Failed", str(err))
+
 
     def _save_workspace(self):
         try:
@@ -1830,60 +1801,6 @@ class DecisionWorkspaceCTK:
         except Exception as e:
             messagebox.showerror("Save Workspace Failed", str(e))
 
-    def _choose_workspace_id(self, workspaces: list[dict]) -> str:
-        if not workspaces:
-            return ""
-        if len(workspaces) == 1:
-            return str(workspaces[0].get("workspace_id") or "")
-
-        chosen = {"workspace_id": ""}
-        win = ctk.CTkToplevel(self.root)
-        win.title("Open Workspace")
-        win.geometry("720x360")
-        win.transient(self.root)
-        win.grab_set()
-
-        frame = ctk.CTkFrame(win, corner_radius=12)
-        frame.pack(fill="both", expand=True, padx=12, pady=12)
-
-        ctk.CTkLabel(frame, text="Select a workspace", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=10, pady=(10, 6))
-
-        lb = tk.Listbox(frame, height=12)
-        lb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        for ws in workspaces:
-            wsid = str(ws.get("workspace_id") or "")
-            label = str(ws.get("name") or "")
-            updated = str(ws.get("updated_at") or "")
-            lb.insert("end", f"{wsid}  |  {label}  |  {updated}")
-        if workspaces:
-            lb.selection_set(0)
-
-        def _accept(_event=None):
-            sel = lb.curselection()
-            if not sel:
-                return
-            chosen["workspace_id"] = str(workspaces[int(sel[0])].get("workspace_id") or "")
-            try:
-                win.grab_release()
-            except Exception:
-                pass
-            win.destroy()
-
-        def _cancel():
-            try:
-                win.grab_release()
-            except Exception:
-                pass
-            win.destroy()
-
-        btns = ctk.CTkFrame(frame, fg_color="transparent")
-        btns.pack(fill="x", padx=10, pady=(0, 10))
-        ctk.CTkButton(btns, text="Open", command=_accept).pack(side="right")
-        ctk.CTkButton(btns, text="Cancel", fg_color="#374151", hover_color="#4B5563", command=_cancel).pack(side="right", padx=(0, 8))
-
-        lb.bind("<Double-1>", _accept)
-        win.wait_window()
-        return str(chosen["workspace_id"] or "").strip()
 
     def _open_workspace(self):
         try:

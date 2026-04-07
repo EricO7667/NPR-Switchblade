@@ -1,0 +1,382 @@
+FAMILY FILTER REPORT
+================================================================================
+
+NPR Part Number : ROW-1
+NPR MFGPN Raw   : GRM21BZ71H475KE15L
+NPR MFGPN Norm  : GRM21BZ71H475KE15L
+
+Methods:
+  anchor: 1 hits in 0.69 ms
+    - score=0.850 item=21-10040-0106 mpn=GRM21BZ71E106KE15L
+
+  edit_distance: 0 hits in 0.61 ms
+
+  ngram_jaccard: 0 hits in 0.64 ms
+
+  token_overlap: 0 hits in 7.79 ms
+
+  progressive_prefix: 1 hits in 19.82 ms
+    - score=0.500 item=21-10040-0106 mpn=GRM21BZ71E106KE15L
+
+Final deduped count: 1
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-2
+NPR MFGPN Raw   : GCM21BR71C225KA64L
+NPR MFGPN Norm  : GCM21BR71C225KA64L
+
+Methods:
+  anchor: 0 hits in 0.88 ms
+
+  progressive_prefix: 0 hits in 8.39 ms
+
+  token_overlap: 0 hits in 12.56 ms
+
+  edit_distance: 0 hits in 0.99 ms
+
+  ngram_jaccard: 0 hits in 1.08 ms
+
+Final deduped count: 0
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-3
+NPR MFGPN Raw   : GRM155R71C104KA88J
+NPR MFGPN Norm  : GRM155R71C104KA88J
+
+Methods:
+  token_overlap: 0 hits in 11.68 ms
+
+  anchor: 0 hits in 1.02 ms
+
+  ngram_jaccard: 0 hits in 0.92 ms
+
+  edit_distance: 0 hits in 1.06 ms
+
+  progressive_prefix: 1 hits in 6.61 ms
+    - score=0.500 item=21-10067-0103 mpn=GRM155R71H103KA88D
+
+Final deduped count: 1
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-4
+NPR MFGPN Raw   : CC0402KRX7R9BB103
+NPR MFGPN Norm  : CC0402KRX7R9BB103
+
+Methods:
+  anchor: 1 hits in 1.05 ms
+    - score=0.850 item=21-10110-0103 mpn=CC0402KRX7R7BB103
+
+  progressive_prefix: 2 hits in 1.51 ms
+    - score=0.941 item=21-10067-0101 mpn=CC0402KRX7R9BB101
+    - score=0.941 item=21-10124-0102 mpn=CC0402KRX7R9BB102
+
+  token_overlap: 0 hits in 12.31 ms
+
+  edit_distance: 3 hits in 1.02 ms
+    - score=0.850 item=21-10067-0101 mpn=CC0402KRX7R9BB101
+    - score=0.850 item=21-10110-0103 mpn=CC0402KRX7R7BB103
+    - score=0.850 item=21-10124-0102 mpn=CC0402KRX7R9BB102
+
+  ngram_jaccard: 2 hits in 1.28 ms
+    - score=0.875 item=21-10067-0101 mpn=CC0402KRX7R9BB101
+    - score=0.875 item=21-10124-0102 mpn=CC0402KRX7R9BB102
+
+Final deduped count: 3
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-5
+NPR MFGPN Raw   : B5819W
+NPR MFGPN Norm  : B5819W
+
+Methods:
+  token_overlap: 0 hits in 12.32 ms
+
+  anchor: 0 hits in 0.01 ms
+
+  progressive_prefix: 1 hits in 0.90 ms
+    - score=1.000 item=48-10440-A001 mpn=B5819W-TP
+
+  edit_distance: 0 hits in 1.06 ms
+
+  ngram_jaccard: 0 hits in 0.97 ms
+
+Final deduped count: 1
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-7
+NPR MFGPN Raw   : QBL8RGB60D0-2897
+NPR MFGPN Norm  : QBL8RGB60D02897
+
+Methods:
+  token_overlap: 0 hits in 12.97 ms
+
+  anchor: 0 hits in 0.89 ms
+
+  progressive_prefix: 0 hits in 6.70 ms
+
+  edit_distance: 0 hits in 1.00 ms
+
+  ngram_jaccard: 0 hits in 0.96 ms
+
+Final deduped count: 0
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-8
+NPR MFGPN Raw   : OSTOQ043250
+NPR MFGPN Norm  : OSTOQ043250
+
+Methods:
+  token_overlap: 0 hits in 13.19 ms
+
+  anchor: 0 hits in 1.02 ms
+
+  progressive_prefix: 0 hits in 4.17 ms
+
+  edit_distance: 0 hits in 0.98 ms
+
+  ngram_jaccard: 0 hits in 0.97 ms
+
+Final deduped count: 0
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-9
+NPR MFGPN Raw   : OSTTJ0431530
+NPR MFGPN Norm  : OSTTJ0431530
+
+Methods:
+  progressive_prefix: 1 hits in 4.91 ms
+    - score=0.500 item=28-10178-A002 mpn=OSTTJ0231530
+
+  anchor: 1 hits in 0.95 ms
+    - score=0.850 item=28-10178-A002 mpn=OSTTJ0231530
+
+  token_overlap: 0 hits in 13.36 ms
+
+  edit_distance: 1 hits in 1.26 ms
+    - score=0.850 item=28-10178-A002 mpn=OSTTJ0231530
+
+  ngram_jaccard: 0 hits in 0.99 ms
+
+Final deduped count: 1
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-10
+NPR MFGPN Raw   : 22284045
+NPR MFGPN Norm  : 22284045
+
+Methods:
+  anchor: 0 hits in 0.00 ms
+
+  token_overlap: 0 hits in 12.41 ms
+
+  progressive_prefix: 2 hits in 2.22 ms
+    - score=0.750 item=28-10037-A006 mpn=22-28-4060
+    - score=0.750 item=28-10042-A008 mpn=22-28-4082
+
+  ngram_jaccard: 0 hits in 1.10 ms
+
+  edit_distance: 0 hits in 0.95 ms
+
+Final deduped count: 2
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-13
+NPR MFGPN Raw   : RC0402FR-07560RL
+NPR MFGPN Norm  : RC0402FR07560RL
+
+Methods:
+  anchor: 1 hits in 0.95 ms
+    - score=0.850 item=06-10058-560R mpn=RC0402JR-07560RL
+
+  progressive_prefix: 27 hits in 4.14 ms
+    - score=0.667 item=06-10056-110K mpn=RC0402FR-07110KL
+    - score=0.667 item=06-10056-113R mpn=RC0402FR-07113RL
+    - score=0.667 item=06-10056-12K4 mpn=RC0402FR-0712K4L
+    - score=0.667 item=06-10056-180R mpn=RC0402FR-07180RL
+    - score=0.667 item=06-10056-1K60 mpn=RC0402FR-071K6L
+    - score=0.667 item=06-10056-1R58 mpn=RC0402FR-071R58L
+    - score=0.667 item=06-10056-200K mpn=RC0402FR-07200KL
+    - score=0.667 item=06-10056-200R mpn=RC0402FR-07200RL
+    - score=0.667 item=06-10056-22R1 mpn=RC0402FR-0722R1L
+    - score=0.667 item=06-10056-27K0 mpn=RC0402FR-0727KL
+    - score=0.667 item=06-10056-2K55 mpn=RC0402FR-072K55L
+    - score=0.667 item=06-10056-2K70 mpn=RC0402FR-072K7L
+    - score=0.667 item=06-10056-2K80 mpn=RC0402FR-072K8L
+    - score=0.667 item=06-10056-2M20 mpn=RC0402FR-072M2L
+    - score=0.667 item=06-10056-30K0 mpn=RC0402FR-0730KL
+    - score=0.667 item=06-10056-330R mpn=RC0402FR-07330RL
+    - score=0.667 item=06-10056-33R0 mpn=RC0402FR-0733RL
+    - score=0.667 item=06-10056-3K60 mpn=RC0402FR-073K6L
+    - score=0.667 item=06-10056-3R57 mpn=RC0402FR-073R57L
+    - score=0.667 item=06-10056-45K3 mpn=RC0402FR-0745K3L
+    - score=0.667 item=06-10056-470R mpn=RC0402FR-07470RL
+    - score=0.667 item=06-10056-47K0 mpn=RC0402FR-0747KL
+    - score=0.667 item=06-10056-4K22 mpn=RC0402FR-074K22L
+    - score=0.667 item=06-10056-4K99 mpn=RC0402FR-074K99L
+    - score=0.667 item=06-10056-69K8 mpn=RC0402FR-0769K8L
+
+  token_overlap: 0 hits in 12.47 ms
+
+  edit_distance: 6 hits in 1.09 ms
+    - score=0.850 item=06-10058-560R mpn=RC0402JR-07560RL
+    - score=0.750 item=06-10056-180R mpn=RC0402FR-07180RL
+    - score=0.750 item=06-10056-200R mpn=RC0402FR-07200RL
+    - score=0.750 item=06-10056-330R mpn=RC0402FR-07330RL
+    - score=0.750 item=06-10056-470R mpn=RC0402FR-07470RL
+    - score=0.750 item=06-10058-120R mpn=RC0402FR-07120RL
+
+  ngram_jaccard: 0 hits in 1.42 ms
+
+Final deduped count: 28
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-14
+NPR MFGPN Raw   : RC0402FR-070RL
+NPR MFGPN Norm  : RC0402FR070RL
+
+Methods:
+  token_overlap: 0 hits in 10.12 ms
+
+  anchor: 2 hits in 0.92 ms
+    - score=0.850 item=06-10056-470R mpn=RC0402FR-07470RL
+    - score=0.850 item=06-10058-0R00 mpn=RC0402JR-070RL
+
+  progressive_prefix: 27 hits in 2.90 ms
+    - score=0.769 item=06-10056-110K mpn=RC0402FR-07110KL
+    - score=0.769 item=06-10056-113R mpn=RC0402FR-07113RL
+    - score=0.769 item=06-10056-12K4 mpn=RC0402FR-0712K4L
+    - score=0.769 item=06-10056-180R mpn=RC0402FR-07180RL
+    - score=0.769 item=06-10056-1K60 mpn=RC0402FR-071K6L
+    - score=0.769 item=06-10056-1R58 mpn=RC0402FR-071R58L
+    - score=0.769 item=06-10056-200K mpn=RC0402FR-07200KL
+    - score=0.769 item=06-10056-200R mpn=RC0402FR-07200RL
+    - score=0.769 item=06-10056-22R1 mpn=RC0402FR-0722R1L
+    - score=0.769 item=06-10056-27K0 mpn=RC0402FR-0727KL
+    - score=0.769 item=06-10056-2K55 mpn=RC0402FR-072K55L
+    - score=0.769 item=06-10056-2K70 mpn=RC0402FR-072K7L
+    - score=0.769 item=06-10056-2K80 mpn=RC0402FR-072K8L
+    - score=0.769 item=06-10056-2M20 mpn=RC0402FR-072M2L
+    - score=0.769 item=06-10056-30K0 mpn=RC0402FR-0730KL
+    - score=0.769 item=06-10056-330R mpn=RC0402FR-07330RL
+    - score=0.769 item=06-10056-33R0 mpn=RC0402FR-0733RL
+    - score=0.769 item=06-10056-3K60 mpn=RC0402FR-073K6L
+    - score=0.769 item=06-10056-3R57 mpn=RC0402FR-073R57L
+    - score=0.769 item=06-10056-45K3 mpn=RC0402FR-0745K3L
+    - score=0.769 item=06-10056-470R mpn=RC0402FR-07470RL
+    - score=0.769 item=06-10056-47K0 mpn=RC0402FR-0747KL
+    - score=0.769 item=06-10056-4K22 mpn=RC0402FR-074K22L
+    - score=0.769 item=06-10056-4K99 mpn=RC0402FR-074K99L
+    - score=0.769 item=06-10056-69K8 mpn=RC0402FR-0769K8L
+
+  edit_distance: 1 hits in 1.11 ms
+    - score=0.850 item=06-10058-0R00 mpn=RC0402JR-070RL
+
+  ngram_jaccard: 1 hits in 1.47 ms
+    - score=0.714 item=06-10056-470R mpn=RC0402FR-07470RL
+
+Final deduped count: 28
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-17
+NPR MFGPN Raw   : RC0402JR-07430RL
+NPR MFGPN Norm  : RC0402JR07430RL
+
+Methods:
+  progressive_prefix: 1 hits in 3.51 ms
+    - score=0.733 item=06-10058-47K0 mpn=RC0402JR-0747KL
+
+  token_overlap: 0 hits in 12.69 ms
+
+  anchor: 1 hits in 0.91 ms
+    - score=0.850 item=06-10056-330R mpn=RC0402FR-07330RL
+
+  edit_distance: 6 hits in 1.22 ms
+    - score=0.750 item=06-10056-330R mpn=RC0402FR-07330RL
+    - score=0.750 item=06-10056-470R mpn=RC0402FR-07470RL
+    - score=0.750 item=06-10058-0R00 mpn=RC0402JR-070RL
+    - score=0.750 item=06-10058-220R mpn=RC0402JR-07220RL
+    - score=0.750 item=06-10058-33R0 mpn=RC0402JR-0733RL
+    - score=0.750 item=06-10058-560R mpn=RC0402JR-07560RL
+
+  ngram_jaccard: 0 hits in 1.50 ms
+
+Final deduped count: 7
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-18
+NPR MFGPN Raw   : NTCG103JF103FT1
+NPR MFGPN Norm  : NTCG103JF103FT1
+
+Methods:
+  token_overlap: 0 hits in 10.32 ms
+
+  anchor: 0 hits in 1.05 ms
+
+  progressive_prefix: 0 hits in 6.77 ms
+
+  ngram_jaccard: 0 hits in 1.09 ms
+
+  edit_distance: 0 hits in 0.96 ms
+
+Final deduped count: 0
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-19
+NPR MFGPN Raw   : TPS73533DRBR
+NPR MFGPN Norm  : TPS73533DRBR
+
+Methods:
+  progressive_prefix: 0 hits in 4.78 ms
+
+  token_overlap: 0 hits in 12.28 ms
+
+  anchor: 0 hits in 0.88 ms
+
+  edit_distance: 0 hits in 0.99 ms
+
+  ngram_jaccard: 0 hits in 0.98 ms
+
+Final deduped count: 0
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-20
+NPR MFGPN Raw   : MAX3485ESA+T
+NPR MFGPN Norm  : MAX3485ESA+T
+
+Methods:
+  token_overlap: 0 hits in 13.29 ms
+
+  progressive_prefix: 0 hits in 5.04 ms
+
+  anchor: 0 hits in 1.02 ms
+
+  edit_distance: 0 hits in 1.02 ms
+
+  ngram_jaccard: 0 hits in 1.06 ms
+
+Final deduped count: 0
+--------------------------------------------------------------------------------
+
+NPR Part Number : ROW-21
+NPR MFGPN Raw   : STM32G030F6P6
+NPR MFGPN Norm  : STM32G030F6P6
+
+Methods:
+  progressive_prefix: 5 hits in 4.77 ms
+    - score=0.538 item=51-10584-A001 mpn=STM32G070CBT6
+    - score=0.538 item=51-10637-A001 mpn=STM32G0B1VBT6
+    - score=0.538 item=51-10637-B001 mpn=STM32G0B1VCT6TR
+    - score=0.538 item=51-10637-C001 mpn=STM32G0B1VET6TR
+    - score=0.538 item=51-10654-A001 mpn=STM32G0B0RET6
+
+  ngram_jaccard: 0 hits in 1.07 ms
+
+  anchor: 0 hits in 1.01 ms
+
+  token_overlap: 0 hits in 12.59 ms
+
+  edit_distance: 0 hits in 1.09 ms
+
+Final deduped count: 5
+--------------------------------------------------------------------------------
+

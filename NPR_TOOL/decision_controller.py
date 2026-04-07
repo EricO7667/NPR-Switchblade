@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -11,7 +11,7 @@ from .matching_engine import MatchingEngine
 from .parsing_engine import parse_description
 from .config_loader import load_config
 from .data_models import (
-    MatchType, MatchResult, InventoryPart, Alternate, DecisionNode, DecisionStatus,
+    MatchType, MatchResult, Alternate, DecisionNode, DecisionStatus,
     DecisionCard, CardDisplay, CardSection, CardState, NodeHeaderState, HeaderControlState,
     CardDetailState, CommittedExportState,
 )
@@ -21,7 +21,7 @@ from openpyxl.utils.cell import range_boundaries, get_column_letter
 from openpyxl.worksheet.table import Table
 
 from .db import connect_db, init_db, DBConfig
-from .repositories import WorkspaceRepo, BomRepo, InventoryCompanyRepo, DecisionNodeRepo, DecisionAltRepo
+from .repositories import WorkspaceRepo, BomRepo, CompanyPartRepo, InventoryImportRepo, DecisionNodeRepo, DecisionAltRepo
 
 from openpyxl import load_workbook
 import os
@@ -32,9 +32,6 @@ import json
 import threading
 from .npr_workspace import (
     NPRWorkspace,
-    NPRPrimaryNewItem,
-    NPRSecondaryRow,
-    NPRRowKind,
     append_external_alternates,
     build_fake_external_alt_specs,
     external_alt_specs_from_node,
@@ -88,6 +85,22 @@ class ControllerConfig:
         "5025": "2010",   # 5025 metric ~= 2010 imperial
         "6332": "2512",   # 6332 metric ~= 2512 imperial
     }
+
+
+@dataclass
+class InventoryPart:
+    """Lightweight controller-local inventory view used by matching/UI code."""
+
+    itemnum: str
+    desc: str = ""
+    mfgid: str = ""
+    mfgname: str = ""
+    vendoritem: str = ""
+    substitutes: List[str] = field(default_factory=list)
+    raw_fields: Dict[str, Any] = field(default_factory=dict)
+    parsed: Dict[str, Any] = field(default_factory=dict)
+    api_data: Any = None
+
 
 # ----------------------------
 # Helpers
@@ -285,8 +298,10 @@ class DecisionController:
         self._pending_inventory_master_path: Optional[str] = None
         self._pending_inventory_erp_path: Optional[str] = None
         
-        # Pending inventory_company rows staged before workspace exists
-        self._pending_inventory_company_rows: list[dict] = []
+        # Pending inventory snapshot rows staged in-memory during imports
+        self._pending_inventory_company_rows: list[Any] = []
+        self._pending_master_rows: list[Any] = []
+        self._pending_erp_rows: list[Any] = []
 
         # ----------------------------
         # DB persistence (workspace)
@@ -294,9 +309,11 @@ class DecisionController:
         self.conn = connect_db(DBConfig())          # uses default ~/.npr_tool/npr.db
         init_db(self.conn)
 
-        self.ws_repo  = WorkspaceRepo(self.conn)
+        self.ws_repo = WorkspaceRepo(self.conn)
         self.bom_repo = BomRepo(self.conn)
-        self.inv_company_repo = InventoryCompanyRepo(self.conn)
+        self.company_part_repo = CompanyPartRepo(self.conn)
+        self.inventory_import_repo = InventoryImportRepo(self.conn)
+        self.inv_company_repo = self.company_part_repo
         self.decision_node_repo = DecisionNodeRepo(self.conn)
         self.decision_alt_repo = DecisionAltRepo(self.conn)
 
@@ -319,6 +336,7 @@ class DecisionController:
         self.workspace: Optional[NPRWorkspace] = None
 
         self._inv_by_itemnum: Dict[str, InventoryPart] = {}
+        self._company_parts_by_cpn: Dict[str, Any] = {}
         self._alt_mpn_to_base: Dict[str, List[str]] = {}
         self._alt_loaded: bool = False
 
@@ -346,6 +364,7 @@ class DecisionController:
     # Loaders
     # ----------------------------
 
+
     def _ensure_inventory_store_workspace(self) -> str:
         """Ensure a hidden singleton workspace row exists for the current inventory store."""
         wsid = self._inventory_store_workspace_id
@@ -355,7 +374,7 @@ class DecisionController:
             row = None
         if row:
             return wsid
-        # Create directly to avoid repo assumptions about generated IDs.
+
         now = datetime.utcnow().isoformat(timespec="seconds")
         self.conn.execute(
             """
@@ -381,10 +400,30 @@ class DecisionController:
         self.conn.commit()
         return wsid
 
-    def _upsert_current_inventory_store(self, company_rows: list[dict], source_label: str = "INVENTORY") -> None:
-        """Incrementally sync the single current inventory store (no delete+rewrite)."""
-        if company_rows is None:
-            return
+    def _dataclass_to_dict(self, obj: Any) -> Dict[str, Any]:
+        if obj is None:
+            return {}
+        if isinstance(obj, dict):
+            return dict(obj)
+        if is_dataclass(obj):
+            return asdict(obj)
+        if hasattr(obj, "__dict__"):
+            return dict(vars(obj))
+        out: Dict[str, Any] = {}
+        for name in dir(obj):
+            if name.startswith("_"):
+                continue
+            try:
+                value = getattr(obj, name)
+            except Exception:
+                continue
+            if callable(value):
+                continue
+            out[name] = value
+        return out
+
+    def _sync_current_inventory_store(self, source_label: str = "INVENTORY") -> None:
+        """Persist the current inventory snapshot using the active repository/schema layer."""
         wsid = self._ensure_inventory_store_workspace()
         now = datetime.utcnow().isoformat(timespec="seconds")
         self.conn.execute(
@@ -393,25 +432,26 @@ class DecisionController:
         )
         self.conn.commit()
 
-        # Incremental DB sync:
-        # - upsert only NEW/CHANGED CPN rows
-        # - prune CPNs missing from the latest master snapshot
-        # - rebuild inventory_company_item only for changed CPNs
-        if hasattr(self.inv_company_repo, "sync_company_parts_incremental"):
-            stats = self.inv_company_repo.sync_company_parts_incremental(wsid, company_rows)
-            try:
-                print(
-                    f"[DB][{(source_label or 'INVENTORY').upper()}] inventory sync:",
-                    f"new_cpn={stats.get('new',0)}",
-                    f"changed_cpn={stats.get('changed',0)}",
-                    f"unchanged_cpn={stats.get('unchanged',0)}",
-                    f"pruned_cpn={stats.get('pruned',0)}",
-                )
-            except Exception:
-                pass
-        else:
-            # Fallback for older repo versions
-            self.inv_company_repo.upsert_company_parts(wsid, company_rows)
+        erp_rows = [self._dataclass_to_dict(r) for r in (self._pending_erp_rows or [])]
+        master_rows = [self._dataclass_to_dict(r) for r in (self._pending_master_rows or [])]
+        company_parts = list(self._pending_inventory_company_rows or [])
+
+        stats = self.inventory_import_repo.replace_inventory_snapshot(
+            wsid,
+            erp_rows=erp_rows,
+            master_rows=master_rows,
+            company_parts=company_parts,
+        )
+        try:
+            print(
+                f"[DB][{(source_label or 'INVENTORY').upper()}] inventory sync:",
+                f"company_parts={stats.get('company_parts', 0)}",
+                f"manufacturer_parts={stats.get('manufacturer_parts', 0)}",
+                f"erp_rows={stats.get('erp_rows', 0)}",
+                f"master_rows={stats.get('master_rows', 0)}",
+            )
+        except Exception:
+            pass
 
     def load_inventory(
         self,
@@ -419,35 +459,33 @@ class DecisionController:
         progress_cb: Optional[Callable[[int, int, str], None]] = None,
         phase_cb: Optional[Callable[[str], None]] = None,
     ) -> int:
-        """Load **master inventory** (CPN-level + alternates) and stage it for DB persistence.
+        """Load the Master workbook, rebuild canonical company-part bundles, and sync the DB."""
+        self._pending_inventory_master_path = xlsx_path
 
-        - Builds inventory_company rows (CPN pooled stock + alternates JSON)
-        - Builds a flat InventoryPart list for MatchingEngine compatibility
-          (CRITICAL: ensure InventoryPart.substitutes includes ALL MPNs under the CPN)
-        """
         if phase_cb:
             try:
-                phase_cb("Reading workbook and parsing descriptions...")
+                phase_cb("Reading master workbook...")
             except Exception:
                 pass
 
-        company_rows, flat_inventory = DataLoader.build_inventory_company_parts(
-            xlsx_path,
-            erp_inventory_path=None,
-            progress_cb=progress_cb,
+        master_rows = DataLoader.load_alternate_master_rows(xlsx_path)
+        self._pending_master_rows = list(master_rows or [])
+
+        if phase_cb:
+            try:
+                phase_cb("Building canonical inventory records...")
+                if progress_cb:
+                    progress_cb(0, 1, "Building canonical inventory records")
+            except Exception:
+                pass
+
+        company_parts = DataLoader.build_company_part_records(
+            erp_rows=list(self._pending_erp_rows or []),
+            master_rows=list(self._pending_master_rows or []),
         )
+        self._pending_inventory_company_rows = list(company_parts or [])
+        self._rebuild_company_part_maps(self._pending_inventory_company_rows)
 
-        # IMPORTANT: do not dedupe here; preserve alternates_json payload exactly as built by DataLoader.
-        # If duplicate rows exist in source data, we want to inspect/fix the loader mapping, not collapse rows here.
-
-        # ---------------------------------------------------------
-        # IMPORTANT FIX:
-        # Do NOT trust flat_inventory to carry the CPN->MPN list correctly.
-        # Rebuild a CPN-level InventoryPart list where:
-        #   vendoritem = representative MPN
-        #   substitutes = all other MPNs under that CPN
-        # This is what the UI bottom-right panel expects.
-        # ---------------------------------------------------------
         if phase_cb:
             try:
                 phase_cb("Rebuilding inventory view...")
@@ -456,69 +494,22 @@ class DecisionController:
             except Exception:
                 pass
 
-        rebuilt_flat = self._company_rows_to_flat_inventory(company_rows)
-
-        self.inventory = rebuilt_flat
+        self.inventory = self._company_rows_to_flat_inventory(self._pending_inventory_company_rows)
         self._inv_by_itemnum = {
             inv.itemnum: inv
             for inv in (self.inventory or [])
             if getattr(inv, "itemnum", "")
         }
 
-        # Stage for DB (workspace may not exist yet)
-        self._pending_inventory_company_rows = company_rows
-        self._pending_inventory_master_path = xlsx_path
-
-        # Persist current inventory store (single current master+ERP state)
-        # IMPORTANT: MASTER should NOT prune ERP-only rows. Merge MASTER data onto current DB rows.
-        try:
-            wsid = self._ensure_inventory_store_workspace()
-            existing_rows = []
+        if phase_cb:
             try:
-                existing_rows = self.inv_company_repo.list(wsid) or []
+                phase_cb("Syncing inventory database...")
+                if progress_cb:
+                    progress_cb(0, 1, "Syncing inventory database")
             except Exception:
-                existing_rows = []
+                pass
+        self._sync_current_inventory_store(source_label="MASTER")
 
-            merged_by_cpn = {}
-            for r in (existing_rows or []):
-                cpn_key = str((r or {}).get("cpn", "") or "").strip()
-                if cpn_key:
-                    merged_by_cpn[cpn_key] = dict(r)
-
-            for r in (company_rows or []):
-                cpn_key = str((r or {}).get("cpn", "") or "").strip()
-                if not cpn_key:
-                    continue
-                ex = merged_by_cpn.get(cpn_key, {})
-                merged_by_cpn[cpn_key] = {
-                    "cpn": cpn_key,
-                    "canonical_desc": str((r or {}).get("canonical_desc", "") or ex.get("canonical_desc", "") or ""),
-                    "stock_total": int((ex or {}).get("stock_total", 0) or (r or {}).get("stock_total", 0) or 0),
-                    "alternates_json": (r or {}).get("alternates_json") or (r or {}).get("alternates") or [],
-                }
-
-            merged_rows = list(merged_by_cpn.values())
-            self._pending_inventory_company_rows = merged_rows
-            if phase_cb:
-                try:
-                    phase_cb("Syncing inventory database...")
-                    if progress_cb:
-                        progress_cb(0, 1, "Syncing inventory database")
-                except Exception:
-                    pass
-            self._upsert_current_inventory_store(merged_rows, source_label="MASTER")
-            if self.workspace_id:
-                self.ws_repo.update_meta(
-                    self.workspace_id,
-                    inventory_master_path=xlsx_path,
-                    inventory_erp_path=(self._pending_inventory_erp_path or ""),
-                )
-        except Exception as e:
-            print(f"[DB] current inventory store update failed: {e}")
-
-        # Treat master inventory as alternates DB too (MPN -> [base itemnum]) using the
-        # already-built company_rows payload. Do NOT reread the master workbook here; that
-        # duplicates the heaviest load/parsing path on the UI thread and can freeze the UI.
         try:
             if phase_cb:
                 try:
@@ -527,10 +518,20 @@ class DecisionController:
                         progress_cb(0, 1, "Building alternate lookup map")
                 except Exception:
                     pass
-            self._alt_mpn_to_base = self._build_mpn_to_base_from_company_rows(company_rows)
+            self._alt_mpn_to_base = self._build_mpn_to_base_from_company_rows(self._pending_inventory_company_rows)
             self._alt_loaded = True
         except Exception:
             pass
+
+        if self.workspace_id:
+            try:
+                self.ws_repo.update_meta(
+                    self.workspace_id,
+                    inventory_master_path=xlsx_path,
+                    inventory_erp_path=(self._pending_inventory_erp_path or ""),
+                )
+            except Exception:
+                pass
 
         if progress_cb:
             try:
@@ -540,132 +541,254 @@ class DecisionController:
 
         return len(self.inventory)
 
-
     def _dedupe_inventory_company_rows(self, rows: list[dict]) -> list[dict]:
-        """Legacy compatibility shim (no-op).
-
-        We intentionally do NOT dedupe inventory_company rows here because it can
-        collapse/strip alternate payloads and hide loader issues. Inventory rows
-        should be preserved exactly as produced by DataLoader, then persisted.
-        """
         return list(rows or [])
 
-    def _build_mpn_to_base_from_company_rows(self, company_rows: list[dict]) -> dict[str, list[str]]:
-        """Build normalized MPN -> [company/base itemnum] from inventory_company rows.
-
-        This replaces the previous controller behavior of calling
-        DataLoader.load_master_inventory(xlsx_path) a second time after the master had already
-        been loaded into company_rows. Re-reading the workbook here doubled the synchronous
-        work on the UI thread and caused freezes/regressions on large master files.
-        """
+    def _build_mpn_to_base_from_company_rows(self, company_rows: list[Any]) -> dict[str, list[str]]:
+        """Build normalized MPN -> [company/base itemnum] from canonical company-part records."""
         out: dict[str, list[str]] = {}
-        norm = getattr(DataLoader, 'norm_mpn_key', None)
+        norm = getattr(DataLoader, "norm_mpn_key", None)
         if not callable(norm):
-            return out
+            norm = lambda s: str(s or "").strip().upper()
 
         for row in (company_rows or []):
-            if not isinstance(row, dict):
-                continue
-            base = str(row.get('cpn', '')).strip()
-            if not base:
+            cpn = ""
+            manufacturer_parts = []
+            if isinstance(row, dict):
+                cpn = str(row.get("cpn") or row.get("company_part_number") or "").strip()
+                manufacturer_parts = list(row.get("manufacturer_parts") or row.get("alternates_json") or row.get("alternates") or [])
+            else:
+                cpn = str(getattr(row, "company_part_number", "") or "").strip()
+                manufacturer_parts = list(getattr(row, "manufacturer_parts", []) or [])
+
+            if not cpn:
                 continue
 
-            alts = row.get('alternates_json') or row.get('alternates') or []
-            if isinstance(alts, str):
-                try:
-                    alts = json.loads(alts)
-                except Exception:
-                    alts = []
+            for part in manufacturer_parts:
+                if isinstance(part, dict):
+                    mpn = str(
+                        part.get("manufacturer_part_number")
+                        or part.get("mpn")
+                        or part.get("mfgpn")
+                        or part.get("vendoritem")
+                        or ""
+                    ).strip()
+                else:
+                    mpn = str(getattr(part, "manufacturer_part_number", "") or "").strip()
 
-            for alt in (alts or []):
-                if not isinstance(alt, dict):
-                    continue
-                mpn = str(alt.get('mpn', '') or alt.get('mfgpn', '') or alt.get('manufacturer_part_number', '')).strip()
                 key = norm(mpn)
                 if not key:
                     continue
                 out.setdefault(key, [])
-                if base not in out[key]:
-                    out[key].append(base)
+                if cpn not in out[key]:
+                    out[key].append(cpn)
         return out
 
-    def _company_rows_to_flat_inventory(self, company_rows: list[dict]) -> list[InventoryPart]:
-        """
-        Convert inventory_company-style rows into a MatchingEngine/UI friendly
-        InventoryPart list where each CPN becomes:
+    def _rebuild_company_part_maps(self, company_rows: list[Any]) -> None:
+        """Rebuild the in-memory company-part lookup keyed by company part number."""
+        out: dict[str, Any] = {}
+        for row in (company_rows or []):
+            cpn = ""
+            if isinstance(row, dict):
+                cpn = str(row.get("cpn") or row.get("company_part_number") or "").strip()
+            else:
+                cpn = str(getattr(row, "company_part_number", "") or "").strip()
+            if cpn:
+                out[cpn] = row
+        self._company_parts_by_cpn = out
 
-          InventoryPart.itemnum   = CPN
-          InventoryPart.vendoritem = representative MPN (shown as the main MPN)
-          InventoryPart.substitutes = all other MPNs under that CPN
+    def _get_company_part_row(self, company_part_number: str) -> Optional[Any]:
+        cpn = str(company_part_number or "").strip()
+        if not cpn:
+            return None
+        return (self._company_parts_by_cpn or {}).get(cpn)
 
-        This is REQUIRED for:
-          - bottom-left cards badge counts
-          - bottom-right “all MFGPNs under company PN” panel
-          - ensuring exact match MPN still shows up (as vendoritem)
-        """
+    def _iter_company_part_manufacturer_parts(self, company_part_number: str) -> list[Any]:
+        row = self._get_company_part_row(company_part_number)
+        if row is None:
+            return []
+        if isinstance(row, dict):
+            return list(row.get("manufacturer_parts") or row.get("alternates_json") or row.get("alternates") or [])
+        return list(getattr(row, "manufacturer_parts", []) or [])
+
+    def _manufacturer_part_mpn(self, part: Any) -> str:
+        if isinstance(part, dict):
+            return str(
+                part.get("manufacturer_part_number")
+                or part.get("mpn")
+                or part.get("mfgpn")
+                or part.get("vendoritem")
+                or ""
+            ).strip()
+        return str(getattr(part, "manufacturer_part_number", "") or getattr(part, "mfgpn", "") or "").strip()
+
+    def _manufacturer_part_to_spec_dict(self, company_part_number: str, part: Any, fallback_inv: Any = None) -> dict:
+        def _pick(obj: Any, *attr_names: str) -> str:
+            if obj is None:
+                return ""
+            raw = {}
+            try:
+                raw = dict(getattr(obj, "raw_fields", {}) or {})
+            except Exception:
+                raw = {}
+            if isinstance(obj, dict):
+                for name in attr_names:
+                    value = obj.get(name)
+                    if value not in (None, ""):
+                        return str(value).strip()
+                for name in attr_names:
+                    value = raw.get(name)
+                    if value not in (None, ""):
+                        return str(value).strip()
+                return ""
+            for name in attr_names:
+                value = getattr(obj, name, None)
+                if value not in (None, ""):
+                    return str(value).strip()
+            for name in attr_names:
+                value = raw.get(name)
+                if value not in (None, ""):
+                    return str(value).strip()
+            return ""
+
+        inv = fallback_inv
+        if inv is None and company_part_number:
+            inv = (self._inv_by_itemnum or {}).get(company_part_number)
+
+        spec = {
+            "ItemNumber": str(company_part_number or "").strip(),
+            "VendorItem": self._manufacturer_part_mpn(part),
+            "Description": _pick(part, "description", "desc"),
+            "MfgName": _pick(part, "manufacturer_name", "manufacturer", "mfgname"),
+            "MfgId": _pick(part, "manufacturer_id", "mfgid"),
+            "PrimaryVendorNumber": "",
+            "TotalQty": "",
+            "LastCost": _pick(part, "last_cost", "lastcost"),
+            "AvgCost": _pick(part, "average_cost", "avg_cost", "avgcost", "unit_cost", "price"),
+            "StandardCost": _pick(part, "standard_cost", "standardcost"),
+            "ItemLeadTime": _pick(part, "item_lead_time", "itemleadtime", "lead_time"),
+            "DefaultWhse": "",
+            "TariffCodeHTSUS": _pick(part, "tariff_code", "tariffcodehtsus", "htsus"),
+            "TariffRate": _pick(part, "tariff_rate", "tariffrate"),
+            "IsERPPrimary": _pick(part, "is_erp_primary"),
+            "MasterSourceRowKey": _pick(part, "master_source_row_key"),
+            "ERPSourceRowKey": _pick(part, "erp_source_row_key"),
+        }
+
+        if inv is not None:
+            inv_raw = dict(getattr(inv, "raw_fields", {}) or {})
+            spec["Description"] = spec["Description"] or str(getattr(inv, "desc", "") or "").strip()
+            spec["PrimaryVendorNumber"] = str(inv_raw.get("primaryvendornumber") or inv_raw.get("supplier") or inv_raw.get("vendor") or "").strip()
+            spec["TotalQty"] = str(inv_raw.get("totalqty") or inv_raw.get("total_qty") or inv_raw.get("qty_on_hand") or inv_raw.get("on_hand") or inv_raw.get("quantity") or "").strip()
+            spec["DefaultWhse"] = str(inv_raw.get("defaultwhse") or inv_raw.get("default_whse") or inv_raw.get("warehouse") or "").strip()
+
+        return spec
+
+    def _get_company_part_mfgpn_options(self, company_part_number: str) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        row = self._get_company_part_row(company_part_number)
+        inv = (self._inv_by_itemnum or {}).get(str(company_part_number or "").strip())
+
+        def add(value: Any) -> None:
+            m = str(value or "").strip()
+            if not m:
+                return
+            k = m.lower()
+            if k in seen:
+                return
+            seen.add(k)
+            out.append(m)
+
+        if inv is not None:
+            add(getattr(inv, "vendoritem", "") or "")
+            for sub in list(getattr(inv, "substitutes", None) or []):
+                if isinstance(sub, str):
+                    add(sub)
+                else:
+                    add(getattr(sub, "mfgpn", "") or getattr(sub, "manufacturer_part_number", "") or "")
+
+        for part in self._iter_company_part_manufacturer_parts(company_part_number):
+            add(self._manufacturer_part_mpn(part))
+
+        if isinstance(row, dict):
+            for m in list(row.get("company_pn_mfgpns") or []):
+                add(m)
+
+        return out
+
+    def _resolve_company_part_manufacturer_part(self, company_part_number: str, mfgpn: str) -> Optional[Any]:
+        target = str(mfgpn or "").strip()
+        if not target:
+            return None
+        target_lower = target.lower()
+        for part in self._iter_company_part_manufacturer_parts(company_part_number):
+            mpn = self._manufacturer_part_mpn(part)
+            if mpn and mpn.lower() == target_lower:
+                return part
+        return None
+
+    def _company_rows_to_flat_inventory(self, company_rows: list[Any]) -> list[InventoryPart]:
         out: list[InventoryPart] = []
-
-        for r in (company_rows or []):
-            inv = self._company_row_to_inventory_part(r)
+        for row in (company_rows or []):
+            inv = self._company_row_to_inventory_part(row)
             if inv is not None:
                 out.append(inv)
-
         return out
 
-    def _company_row_to_inventory_part(self, row: dict) -> Optional[InventoryPart]:
-        """
-        Build a synthetic InventoryPart from an inventory_company row.
-
-        IMPORTANT:
-        - Do not re-run description parsing here.
-        - The loader is responsible for parsing once and attaching row["parsed"].
-        - Re-parsing during rebuild caused the post-progress-bar hang/crash.
-        """
-
-        if not isinstance(row, dict):
+    def _company_row_to_inventory_part(self, row: Any) -> Optional[InventoryPart]:
+        if row is None:
             return None
 
-        cpn = str(row.get("cpn", "")).strip()
+        if isinstance(row, dict):
+            cpn = str(row.get("cpn") or row.get("company_part_number") or "").strip()
+            desc = str(row.get("canonical_desc") or row.get("description") or "").strip()
+            total_qty = row.get("stock_total")
+            if total_qty is None:
+                total_qty = row.get("total_qty")
+            manufacturer_parts = list(row.get("manufacturer_parts") or row.get("alternates_json") or row.get("alternates") or [])
+            raw_fields = dict(row.get("raw_fields") or {})
+        else:
+            cpn = str(getattr(row, "company_part_number", "") or "").strip()
+            desc = str(getattr(row, "description", "") or "").strip()
+            total_qty = getattr(row, "total_qty", None)
+            manufacturer_parts = list(getattr(row, "manufacturer_parts", []) or [])
+            raw_fields = dict(getattr(row, "raw_fields", {}) or {})
+
         if not cpn:
             return None
 
-        desc = str(row.get("canonical_desc", "")).strip()
-        stock_total = int(row.get("stock_total", 0) or 0)
-
-        parsed_raw = row.get("parsed")
-        parsed = dict(parsed_raw) if isinstance(parsed_raw, dict) else {}
-
-        alts = row.get("alternates_json") or row.get("alternates") or []
-        if isinstance(alts, str):
-            try:
-                alts = json.loads(alts)
-            except Exception:
-                alts = []
-        if not isinstance(alts, list):
-            alts = []
+        try:
+            stock_total = int(float(total_qty or 0))
+        except Exception:
+            stock_total = 0
 
         mpns: list[str] = []
         mfgname = ""
         mfgid = ""
 
-        for a in alts:
-            if not isinstance(a, dict):
-                continue
+        for part in manufacturer_parts:
+            if isinstance(part, dict):
+                mpn = str(
+                    part.get("manufacturer_part_number")
+                    or part.get("mpn")
+                    or part.get("mfgpn")
+                    or part.get("vendoritem")
+                    or ""
+                ).strip()
+                part_mfgname = str(part.get("manufacturer_name") or part.get("mfgname") or "").strip()
+                part_mfgid = str(part.get("manufacturer_id") or part.get("mfgid") or "").strip()
+            else:
+                mpn = str(getattr(part, "manufacturer_part_number", "") or "").strip()
+                part_mfgname = str(getattr(part, "manufacturer_name", "") or "").strip()
+                part_mfgid = str(getattr(part, "manufacturer_id", "") or "").strip()
 
-            mpn = str(
-                a.get("mpn")
-                or a.get("mfgpn")
-                or a.get("vendoritem")
-                or ""
-            ).strip()
             if not mpn:
                 continue
-
             if not mfgname:
-                mfgname = str(a.get("mfgname", "") or "").strip()
+                mfgname = part_mfgname
             if not mfgid:
-                mfgid = str(a.get("mfgid", "") or "").strip()
-
+                mfgid = part_mfgid
             if mpn not in mpns:
                 mpns.append(mpn)
 
@@ -679,38 +802,18 @@ class DecisionController:
             mfgname=mfgname,
             vendoritem=rep_mpn,
             substitutes=subs,
-            raw_fields={
-                "totalqty": stock_total,
-            },
-            parsed=parsed,
+            raw_fields={"totalqty": stock_total, **raw_fields},
+            parsed={},
             api_data=None,
         )
-
         inv._all_mpns = list(mpns)
+        inv._manufacturer_parts = list(manufacturer_parts or [])
         return inv
-    
-
 
     def load_alternates_db(self, xlsx_path: str) -> tuple[int, int]:
-        """Compatibility shim.
-
-        The master file now *is* the inventory + alternates source. This call simply reloads the
-        master inventory and returns counts like the old function did.
-        """
-        inventory_parts, subs_by_base, mpn_to_base = DataLoader.load_master_inventory(xlsx_path)
-
-        self.inventory = inventory_parts
-        self._inv_by_itemnum = {
-            inv.itemnum: inv
-            for inv in (self.inventory or [])
-            if getattr(inv, "itemnum", "")
-        }
-
-        self._alt_mpn_to_base = mpn_to_base or {}
-        self._alt_loaded = True
-
-        num_with_subs = sum(1 for _, subs in (subs_by_base or {}).items() if subs)
-        return num_with_subs, len(self._alt_mpn_to_base)
+        count = self.load_inventory(xlsx_path)
+        num_with_subs = sum(1 for inv in (self.inventory or []) if getattr(inv, "substitutes", []))
+        return num_with_subs, count
 
     def load_items_inventory(
         self,
@@ -718,10 +821,7 @@ class DecisionController:
         progress_cb: Optional[Callable[[int, int, str], None]] = None,
         phase_cb: Optional[Callable[[str], None]] = None,
     ) -> int:
-        """Load the ERP inventory extract and attach stock totals at the CPN level.
-
-        In the v2 model, stock is ONLY stored on the company part number record (inventory_company).
-        """
+        """Load the ERP workbook, rebuild canonical company-part bundles, and sync the DB."""
         self._pending_inventory_erp_path = xlsx_path
 
         if phase_cb:
@@ -730,76 +830,24 @@ class DecisionController:
             except Exception:
                 pass
 
-        try:
-            stock_totals = DataLoader.load_erp_stock_totals(xlsx_path)
-        except Exception as e:
-            raise ValueError(f"Failed to load ERP inventory stock totals: {e}")
+        erp_rows = DataLoader.load_erp_rows(xlsx_path)
+        self._pending_erp_rows = list(erp_rows or [])
 
-        merged = 0
-
-        # Build working set from current DB inventory store + any staged rows.
-        wsid = self._ensure_inventory_store_workspace()
-        db_rows = []
-        try:
-            db_rows = self.inv_company_repo.list(wsid) or []
-        except Exception:
-            db_rows = []
-
-        by_cpn = {str(r.get("cpn", "")).strip(): dict(r) for r in (db_rows or []) if str(r.get("cpn", "")).strip()}
-        for r in (self._pending_inventory_company_rows or []):
-            cpn_key = str((r or {}).get("cpn", "")).strip()
-            if cpn_key:
-                # staged rows (e.g., just-loaded MASTER) should override DB metadata
-                by_cpn[cpn_key] = dict(r)
-
-        # DEBUG: show sample ERP rows that are not found in the currently loaded master CPN set.
-        master_cpns = {str((r or {}).get("cpn", "")).strip() for r in (self._pending_inventory_company_rows or []) if str((r or {}).get("cpn", "")).strip()}
-        erp_only = []
-        for cpn, qty in stock_totals.items():
-            cpn_key = str(cpn or "").strip()
-            if not cpn_key:
-                continue
-            if master_cpns and cpn_key not in master_cpns:
-                erp_only.append((cpn_key, int(qty or 0)))
-
-        if erp_only:
-            print(f"[DB][DEBUG] ERP rows not found in MASTER: count={len(erp_only)} (showing up to 5)")
-            for cpn_key, qty in erp_only[:5]:
-                print(f"[DB][DEBUG] ERP-only sample: cpn={cpn_key!r} qty={qty}")
-
-        total_stock_rows = max(1, len(stock_totals))
         if phase_cb:
             try:
-                phase_cb("Merging ERP stock totals...")
+                phase_cb("Building canonical inventory records...")
+                if progress_cb:
+                    progress_cb(0, 1, "Building canonical inventory records")
             except Exception:
                 pass
 
-        for idx, (cpn, qty) in enumerate(stock_totals.items(), start=1):
-            cpn_key = str(cpn or "").strip()
-            if not cpn_key:
-                continue
-            row = by_cpn.get(cpn_key)
-            if row is None:
-                row = {
-                    "cpn": cpn_key,
-                    "canonical_desc": "",
-                    "stock_total": 0,
-                    "alternates_json": [],
-                }
-                by_cpn[cpn_key] = row
-            row["stock_total"] = int(qty or 0)
-            merged += 1
-            if progress_cb and (idx % 250 == 0 or idx == total_stock_rows):
-                try:
-                    progress_cb(idx, total_stock_rows, f"Merging ERP stock totals {idx}/{total_stock_rows}")
-                except Exception:
-                    pass
+        company_parts = DataLoader.build_company_part_records(
+            erp_rows=list(self._pending_erp_rows or []),
+            master_rows=list(self._pending_master_rows or []),
+        )
+        self._pending_inventory_company_rows = list(company_parts or [])
+        self._rebuild_company_part_maps(self._pending_inventory_company_rows)
 
-        self._pending_inventory_company_rows = list(by_cpn.values())
-
-
-        # Refresh the live in-memory inventory snapshot too.
-        # Otherwise UI cards keep using stale InventoryPart.raw_fields["totalqty"].
         try:
             if phase_cb:
                 try:
@@ -808,32 +856,29 @@ class DecisionController:
                         progress_cb(0, 1, "Rebuilding inventory view")
                 except Exception:
                     pass
-            rebuilt_flat = self._company_rows_to_flat_inventory(self._pending_inventory_company_rows)
-            self.inventory = rebuilt_flat
+            self.inventory = self._company_rows_to_flat_inventory(self._pending_inventory_company_rows)
             self._inv_by_itemnum = {
                 inv.itemnum: inv
                 for inv in (self.inventory or [])
                 if getattr(inv, "itemnum", "")
             }
         except Exception as e:
-            print(f"[CTRL] failed to refresh in-memory inventory after ERP merge: {e}")
+            print(f"[CTRL] failed to refresh in-memory inventory after ERP import: {e}")
 
-        # IMPORTANT: no dedupe pass here. Preserve the staged rows/alternates exactly as loaded.
+        if phase_cb:
+            try:
+                phase_cb("Syncing inventory database...")
+                if progress_cb:
+                    progress_cb(0, 1, "Syncing inventory database")
+            except Exception:
+                pass
+        self._sync_current_inventory_store(source_label="ERP")
 
-        # Persist current inventory store immediately
-        try:
-            if phase_cb:
-                try:
-                    phase_cb("Syncing inventory database...")
-                    if progress_cb:
-                        progress_cb(0, 1, "Syncing inventory database")
-                except Exception:
-                    pass
-            self._upsert_current_inventory_store(self._pending_inventory_company_rows, source_label="ERP")
-            if self.workspace_id:
+        if self.workspace_id:
+            try:
                 self.ws_repo.update_meta(self.workspace_id, inventory_erp_path=xlsx_path)
-        except Exception as e:
-            print(f"[DB] current inventory store update (ERP) failed: {e}")
+            except Exception:
+                pass
 
         if progress_cb:
             try:
@@ -841,18 +886,25 @@ class DecisionController:
             except Exception:
                 pass
 
-        return merged
+        return len(self._pending_erp_rows)
 
-    def load_npr(self, xlsx_path: str) -> int:
-        """
-        Load a BOM/NPR file and ALWAYS create a NEW workspace for it.
+    def _load_bom_rows_from_workbook(self, xlsx_path: str) -> List[Any]:
+        """Load BOM rows only through the canonical DataLoader BOM pipeline."""
+        rows = DataLoader.load_bom_any(xlsx_path)
+        out: List[Any] = []
+        for i, part in enumerate(rows, start=1):
+            if not getattr(part, "partnum", ""):
+                part.partnum = f"ROW-{i}"
+            out.append(part)
+        return out
 
-        Rationale:
-          - Workspaces represent independent jobs/projects.
-          - BOMs should never be mixed into the same workspace.
-          - Re-opening an existing workspace is handled via open_workspace().
-        """
-        # Hard reset "session state" that must NOT bleed across workspaces
+    def load_npr(
+        self,
+        xlsx_path: str,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+        phase_cb: Optional[Callable[[str], None]] = None,
+        ) -> int:
+        """Load a BOM workbook, create a new workspace, and persist canonical BOM input rows."""
         self.npr_list = []
         self.match_pairs = []
         self.nodes = []
@@ -860,17 +912,23 @@ class DecisionController:
         self.workspace = None
         self._bom_row_by_uid = {}
 
-        rows = DataLoader.load_bom_any(xlsx_path)
+        if phase_cb:
+            try:
+                phase_cb("Reading BOM workbook...")
+            except Exception:
+                pass
+
+        rows = self._load_bom_rows_from_workbook(xlsx_path)
         self.npr_list = rows
 
-        # --- DB persistence layer ---
-        with open(xlsx_path, "rb") as f:
-            file_bytes = f.read()
+        if phase_cb:
+            try:
+                phase_cb("Creating workspace and saving BOM input...")
+                if progress_cb:
+                    progress_cb(0, 1, "Saving BOM input")
+            except Exception:
+                pass
 
-        # Create a new BOM artifact every time we import
-                # ----------------------------
-        # DB: create workspace + persist canonical BOM input + bootstrap mutable state
-        # ----------------------------
         ws_name = Path(xlsx_path).stem
         self.workspace_id = self.ws_repo.create(
             name=ws_name,
@@ -883,13 +941,9 @@ class DecisionController:
             status="ACTIVE",
         )
 
-        # Persist BOM input (canonical)
         inputs: List[Dict[str, Any]] = []
         for i, p in enumerate(self.npr_list or [], start=1):
             raw = p.to_dict() if hasattr(p, "to_dict") else {}
-            raw.setdefault("raw_fields", getattr(p, "raw_fields", {}))
-            raw.setdefault("parsed", getattr(p, "parsed", {}))
-
             qty = None
             try:
                 q_raw = (getattr(p, "raw_fields", {}) or {}).get("quantity", "")
@@ -913,31 +967,19 @@ class DecisionController:
             )
 
         self.bom_repo.upsert_inputs(self.workspace_id, inputs)
+        try:
+            self.bom_repo.bootstrap_state_from_inputs(self.workspace_id, overwrite_existing=False)
+        except Exception:
+            pass
 
-        # Do NOT persist inventory per-workspace (prevents DB bloat).
-        # Inventory is stored once in the current inventory store.
+        if progress_cb:
+            try:
+                progress_cb(1, 1, "Done")
+            except Exception:
+                pass
 
         return len(self.npr_list)
-
-
-    def flush_workspace_to_db(self) -> None:
-        """Persist the current workspace decision state."""
-        if not self.workspace_id:
-            return
-        try:
-            self.save_workspace_state()
-        except Exception as e:
-            print(f"[DB] save_workspace_state failed: {e}")
-
-    def cleanup_unused_tables(self) -> None:
-        """Optional maintenance for the active decision-state tables."""
-        try:
-            self.conn.execute("DELETE FROM decision_alt")
-            self.conn.execute("DELETE FROM decision_node")
-            self.conn.commit()
-        except Exception as e:
-            print(f"[DB] cleanup_unused_tables failed: {e}")
-
+    
     def load_cns(self, xlsx_path: str) -> int:
         self.cns_records = DataLoader.load_cns_workbook(xlsx_path)
         return len(self.cns_records)
@@ -1121,26 +1163,12 @@ class DecisionController:
 
     def _rehydrate_npr_inputs(self, workspace_id: str) -> List[Any]:
         npr_list: List[Any] = []
-        for r in (self.bom_repo.list_inputs(workspace_id) or []):
-            raw = r.get("raw_json") or {}
-            raw_fields = {}
-            parsed = {}
-            if isinstance(raw, dict):
-                raw_fields = raw.get("raw_fields") or {}
-                parsed = raw.get("parsed") or {}
-            npr_list.append(
-                SimpleNamespace(
-                    partnum=r.get("partnum", "") or f"ROW-{r.get('input_line_id')}",
-                    bom_uid=r.get("partnum", "") or str(r.get("input_line_id") or ""),
-                    mfgpn=r.get("mfgpn", "") or "",
-                    bom_mpn=r.get("mfgpn", "") or "",
-                    mfgname=r.get("mfgname", "") or "",
-                    supplier=r.get("supplier", "") or "",
-                    description=r.get("description", "") or "",
-                    raw_fields=raw_fields if isinstance(raw_fields, dict) else {},
-                    parsed=parsed if isinstance(parsed, dict) else {},
-                )
-            )
+        for i, part in enumerate(self.bom_repo.list_input_parts(workspace_id) or [], start=1):
+            if not getattr(part, "partnum", ""):
+                part.partnum = f"ROW-{i}"
+            setattr(part, "bom_uid", getattr(part, "partnum", "") or str(i))
+            setattr(part, "bom_mpn", getattr(part, "mfgpn", "") or "")
+            npr_list.append(part)
         return npr_list
 
     def _card_id_for_alt(self, node_id: str, alt_id: str) -> str:
@@ -1427,8 +1455,16 @@ class DecisionController:
         export_opts = [str(m).strip() for m in list(payload.get("export_mfgpn_options") or []) if str(m).strip()]
         selected_export_mfgpn = str(payload.get("selected_export_mfgpn", "") or specs.get("VendorItem", "") or "").strip()
 
-        pn = (getattr(card, "company_part_number", "") or getattr(card, "manufacturer_part_number", "") or "").strip()
-        title_txt = f"Information • {pn}" if pn else "Information"
+        company_pn = (getattr(card, "company_part_number", "") or "").strip()
+        shown_mfgpn = selected_export_mfgpn or (getattr(card, "manufacturer_part_number", "") or "").strip()
+        if company_pn and shown_mfgpn:
+            title_txt = f"Information • {company_pn} • {shown_mfgpn}"
+        elif company_pn:
+            title_txt = f"Information • {company_pn}"
+        elif shown_mfgpn:
+            title_txt = f"Information • {shown_mfgpn}"
+        else:
+            title_txt = "Information"
 
         return CardDetailState(
             node_id=node.id,
@@ -1844,6 +1880,8 @@ class DecisionController:
         """Return the active selected alternate used by header/export state."""
         try:
             for alt in (getattr(node, "alternates", []) or []):
+                print("this is inside of selcted_commited_alt")
+                print(alt)
                 if bool(getattr(alt, "selected", False)) and not bool(getattr(alt, "rejected", False)):
                     return alt
         except Exception:
@@ -1861,6 +1899,7 @@ class DecisionController:
         if bool(getattr(node, "locked", False)):
             return False
         selected_alt = selected_alt if selected_alt is not None else self._selected_committed_alt(node)
+        #print("_selected_committed_alt: inside of jeader_manuel_editable")
         if selected_alt is None:
             return True
         if self._all_alternates_rejected(node):
@@ -1871,6 +1910,7 @@ class DecisionController:
         """Derive a controller-owned header snapshot from committed node state."""
         alts = list(getattr(node, "alternates", []) or [])
         selected_alt = self._selected_committed_alt(node)
+        #print("_selected_committed_alt inside of _compute_node_header_state")
 
         all_rejected = self._all_alternates_rejected(node)
 
@@ -3088,6 +3128,7 @@ class DecisionController:
             node.suggested_pb = f"{prefix}-{body}"
             node.suggested_reason = f"from type mapping ({ptype})"
 
+
     def _pair_to_node(self, npr_part: Any, match: Any, input_line_id: int) -> DecisionNode:
         """Convert a (BOM input, MatchResult) pair into a UI-facing DecisionNode.
 
@@ -3809,9 +3850,33 @@ class DecisionController:
         mfgpn = (mfgpn or '').strip()
         if not mfgpn:
             raise ValueError('MFG PN is blank.')
+
+        company_part_number = (getattr(alt, 'internal_part_number', '') or '').strip()
+        part_row = self._resolve_company_part_manufacturer_part(company_part_number, mfgpn)
+
         alt.manufacturer_part_number = mfgpn
         alt.meta = dict(getattr(alt, 'meta', {}) or {})
         alt.meta['company_pn_rep_vendoritem'] = mfgpn
+
+        if part_row is not None:
+            part_specs = self._manufacturer_part_to_spec_dict(company_part_number, part_row)
+            alt.description = str(part_specs.get('Description', '') or getattr(alt, 'description', '') or '').strip()
+            alt.manufacturer = str(part_specs.get('MfgName', '') or getattr(alt, 'manufacturer', '') or '').strip()
+            avg_cost_raw = str(part_specs.get('AvgCost', '') or '').strip()
+            try:
+                alt.unit_cost = float(avg_cost_raw) if avg_cost_raw else getattr(alt, 'unit_cost', None)
+            except Exception:
+                pass
+            total_qty_raw = str(part_specs.get('TotalQty', '') or '').strip()
+            try:
+                if total_qty_raw:
+                    alt.stock = int(float(total_qty_raw))
+            except Exception:
+                pass
+            alt.raw = part_row
+            alt.meta['selected_company_part_mfgpn'] = mfgpn
+            alt.meta['selected_company_part_mfgpn_specs'] = part_specs
+
         node.preferred_inventory_mfgpn = mfgpn
         node.inventory_mpn = mfgpn
         self._persist_node_and_alts(node)
@@ -3865,109 +3930,39 @@ class DecisionController:
 
         if (getattr(alt, "source", "") or "").strip().lower() == "inventory":
             itemnum = (getattr(alt, "internal_part_number", "") or "").strip()
-            inv = None
-            if itemnum:
-                inv = self._inv_by_itemnum.get(itemnum)
-            inv = inv or getattr(alt, "raw", None)
+            inv = self._inv_by_itemnum.get(itemnum) if itemnum else None
 
-            if inv is not None:
-                seen = set()
-
-                def add_mpn(m):
-                    m = (m or "").strip()
-                    if not m:
-                        return
-                    k = m.lower()
-                    if k in seen:
-                        return
-                    seen.add(k)
-                    export_opts.append(m)
-
-                # Build export options strictly from company-part grouping truth.
-                base_vendoritem = (getattr(inv, "vendoritem", "") or "").strip() or _raw_get(inv, "vendoritem", "vendor_item", "mfgpn")
-                add_mpn(base_vendoritem)
-
-                # grouped aliases stamped during candidate collapsing
-                for m in list((getattr(alt, "meta", {}) or {}).get("company_pn_mfgpns", []) or []):
-                    add_mpn(m)
-
-                # inventory substitutes
-                subs = list(getattr(inv, "substitutes", None) or [])
-                for s in subs:
-                    if isinstance(s, str):
-                        add_mpn(s)
-                    else:
-                        add_mpn(getattr(s, "mfgpn", "") or getattr(s, "manufacturer_part_number", "") or _pick_sub_field(s, "mfgpn", "vendoritem", "vendor_item"))
-
-                # selected export MFG PN (must be valid under this CPN)
-                current_selected = (getattr(alt, "manufacturer_part_number", "") or "").strip()
-                if current_selected and current_selected.lower() in seen:
-                    selected_vendoritem = current_selected
+            export_opts = self._get_company_part_mfgpn_options(itemnum)
+            current_selected = (getattr(alt, "manufacturer_part_number", "") or "").strip()
+            if current_selected and current_selected.lower() in {m.lower() for m in export_opts}:
+                selected_vendoritem = current_selected
+            else:
+                pref = str((getattr(node, "preferred_inventory_mfgpn", "") or "")).strip()
+                if pref and pref.lower() in {m.lower() for m in export_opts}:
+                    selected_vendoritem = pref
+                elif export_opts:
+                    selected_vendoritem = export_opts[0]
                 else:
-                    pref = str((getattr(node, "preferred_inventory_mfgpn", "") or "")).strip()
-                    if pref and pref.lower() in seen:
-                        selected_vendoritem = pref
-                    else:
-                        selected_vendoritem = base_vendoritem or (export_opts[0] if export_opts else "")
+                    selected_vendoritem = current_selected
 
-                # If the selected vendor item corresponds to a substitute object, surface THAT
-                # substitute's details in the panel (description/manufacturer/etc.).
-                selected_sub = None
-                if selected_vendoritem:
-                    sv = selected_vendoritem.strip().lower()
-                    for s in subs:
-                        if isinstance(s, str):
-                            continue
-                        smpn = (getattr(s, "mfgpn", "") or getattr(s, "manufacturer_part_number", "") or _pick_sub_field(s, "mfgpn", "vendoritem", "vendor_item")).strip()
-                        if smpn and smpn.lower() == sv:
-                            selected_sub = s
-                            break
-
-                # Base values from the inventory/company item row
-                desc_val = (getattr(inv, "desc", "") or "").strip() or _raw_get(inv, "desc", "description")
-                mfg_name_val = (getattr(inv, "mfgname", "") or "").strip() or _raw_get(inv, "mfgname", "manufacturer_name")
-                mfg_id_val = (getattr(inv, "mfgid", "") or "").strip() or _raw_get(inv, "mfgid", "manufacturer_id")
-                supplier_val = _raw_get(inv, "primaryvendornumber", "supplier", "vendor")
-                last_cost_val = _raw_get(inv, "lastcost", "last_cost")
-                avg_cost_val = _raw_get(inv, "avgcost", "avg_cost", "average_cost")
-                lead_val = _raw_get(inv, "itemleadtime", "item_lead_time", "lead_time")
-
-                # Override with substitute details when available for the selected alternate MPN
-                if selected_sub is not None:
-                    desc_val = _pick_sub_field(selected_sub, "description", "desc") or desc_val
-                    mfg_name_val = _pick_sub_field(selected_sub, "manufacturer", "mfgname", "manufacturer_name") or mfg_name_val
-                    mfg_id_val = _pick_sub_field(selected_sub, "mfgid", "manufacturer_id") or mfg_id_val
-                    supplier_val = _pick_sub_field(selected_sub, "supplier", "vendor", "primaryvendornumber") or supplier_val
-                    # cost fields vary by source naming
-                    avg_cost_val = (
-                        _pick_sub_field(selected_sub, "unit_cost", "avgcost", "avg_cost", "price")
-                        or avg_cost_val
-                    )
-                    last_cost_val = (
-                        _pick_sub_field(selected_sub, "lastcost", "last_cost", "unit_cost", "price")
-                        or last_cost_val
-                    )
-                    lead_val = _pick_sub_field(selected_sub, "lead_time", "itemleadtime", "item_lead_time") or lead_val
-
+            part_row = self._resolve_company_part_manufacturer_part(itemnum, selected_vendoritem)
+            if part_row is not None:
+                specs = self._manufacturer_part_to_spec_dict(itemnum, part_row, fallback_inv=inv)
+            else:
                 specs = {
-                    "ItemNumber": (getattr(inv, "itemnum", "") or "").strip() or _raw_get(inv, "itemnum", "item_number", "itemnumber"),
+                    "ItemNumber": itemnum,
                     "VendorItem": selected_vendoritem,
-                    "Description": desc_val,
-                    "MfgName": mfg_name_val,
-                    "MfgId": mfg_id_val,
-                    "PrimaryVendorNumber": supplier_val,
-                    "TotalQty": _raw_get(inv, "totalqty", "total_qty", "qty_on_hand", "on_hand", "quantity"),
-                    "LastCost": last_cost_val,
-                    "AvgCost": avg_cost_val,
-                    "ItemLeadTime": lead_val,
-                    "DefaultWhse": _raw_get(inv, "defaultwhse", "default_whse", "warehouse"),
-                    "TariffCodeHTSUS": _raw_get(inv, "tariffcodehtsus", "htsus", "tariff_code"),
+                    "Description": (getattr(alt, "description", "") or "").strip(),
+                    "MfgName": (getattr(alt, "manufacturer", "") or "").strip(),
+                    "PrimaryVendorNumber": _raw_get(inv, "primaryvendornumber", "supplier", "vendor") if inv is not None else "",
+                    "TotalQty": _raw_get(inv, "totalqty", "total_qty", "qty_on_hand", "on_hand", "quantity") if inv is not None else "",
+                    "AvgCost": "" if getattr(alt, "unit_cost", None) in (None, "") else str(getattr(alt, "unit_cost", "")),
+                    "DefaultWhse": _raw_get(inv, "defaultwhse", "default_whse", "warehouse") if inv is not None else "",
                 }
 
-                if export_opts:
-                    specs["AlternatesCount"] = str(len(export_opts))
-                    specs["AlternatesList"] = "\n".join(export_opts)
-
+            if export_opts:
+                specs["AlternatesCount"] = str(len(export_opts))
+                specs["AlternatesList"] = "\n".join(export_opts)
         else:
             # Non-inventory alt fallback details
             specs = {
@@ -4085,16 +4080,26 @@ class DecisionController:
         return out
 
     def _export_mfg_fields_for_node(self, node: DecisionNode) -> tuple[str, str]:
-        preferred_inventory_mfgpn = (getattr(node, "preferred_inventory_mfgpn", "") or "").strip()
+        sel = self._selected_committed_alt(node)
+        print(f"_EXPORT_MFG_FIELDS this is sel: {sel}")
+
+        # 1. Selected alt always wins
+        if sel is not None and not bool(getattr(sel, "rejected", False)):
+            return (
+                str(getattr(sel, "manufacturer", "") or "").strip(),
+                str(getattr(sel, "manufacturer_part_number", "") or "").strip(),
+            )
+
+        # 2. No selected alt: try anchored inventory state
         anchored_cpn = self._export_company_part_number_for_node(node)
         if anchored_cpn == "NEW":
             anchored_cpn = ""
-        inv_alt = self._selected_inventory_alt(node)
 
+        inv_alt = self._selected_inventory_alt(node)
         if inv_alt is not None or anchored_cpn:
             manufacturer = str(getattr(inv_alt, "manufacturer", "") or "").strip() if inv_alt is not None else ""
             mpn = (
-                preferred_inventory_mfgpn
+                str(getattr(node, "preferred_inventory_mfgpn", "") or "").strip()
                 or str(getattr(node, "inventory_mpn", "") or "").strip()
                 or (str(getattr(inv_alt, "manufacturer_part_number", "") or "").strip() if inv_alt is not None else "")
                 or (str(getattr(inv_alt, "_matched_mpn_ui", "") or "").strip() if inv_alt is not None else "")
@@ -4108,17 +4113,19 @@ class DecisionController:
             if mpn:
                 return (manufacturer, mpn)
 
+        # 3. External/manual fallback
         for a in self._selected_external_alts_for_export(node):
             return (
                 str(getattr(a, "manufacturer", "") or "").strip(),
                 str(getattr(a, "manufacturer_part_number", "") or "").strip(),
             )
 
-        # Last fallback for ready/manual nodes with no card selection.
+        # 4. Last fallback
         return ("", str(getattr(node, "bom_mpn", "") or "").strip())
 
     def build_committed_export_state(self, node: DecisionNode) -> CommittedExportState:
         selected_alt = self._selected_committed_alt(node)
+        #print(f"this is the selected_alt in the build committed export state: {self.selected_alt}")
         mfg, mfgpn = self._export_mfg_fields_for_node(node)
         section = self.get_node_bom_section(node.id)
         bucket, type_value = self._section_bucket(section)
@@ -4145,6 +4152,15 @@ class DecisionController:
 
     def export_npr(self, output_path: str = None):
         return NPRWorkbookExporter(self).export(output_path)
+    
+    def flush_workspace_to_db(self) -> None:
+        """Persist the current workspace decision state."""
+        if not self.workspace_id:
+            return
+        try:
+            self.save_workspace_state()
+        except Exception as e:
+            print(f"[DB] save_workspace_state failed: {e}")
 
     def _export_npr_impl(self, output_path: str = None):
             """Export a single Excel workbook containing BOM + NPR outputs in separate sheets.
@@ -4905,7 +4921,11 @@ class DecisionController:
                 ctx = _line_context_for_node(node)
                 export_state = self.build_committed_export_state(node)
                 desc = export_state.description_text
+
+                # need to change this to be for the NODE.mfgpn not the BOM mfgpn
                 bom_mpn = _normalize_text(export_state.bom_mpn)
+
+
                 company_pn = _normalize_text(export_state.company_part_number)
                 type_val = export_state.type_value
                 note_text = _normalize_text(export_state.notes)

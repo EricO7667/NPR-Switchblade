@@ -1,41 +1,64 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shutil
 import tempfile
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from .data_models import InventoryPart, NPRPart, CNSRecord, SubstitutePart
-from .parsing_engine import parse_description
-from .config_loader import load_config
+from .data_models import (
+    AlternateMasterRow,
+    CNSRecord,
+    CompanyPartRecord,
+    ERPInventoryRow,
+    ManufacturerPartRecord,
+    NPRPart,
+)
+
+try:
+    from .parsing_engine import parse_description  # type: ignore
+except Exception:  # pragma: no cover
+    parse_description = None
+
+try:
+    from .config_loader import load_config  # type: ignore
+except Exception:  # pragma: no cover
+    load_config = None
 
 
-PB_RE = re.compile(r"\b(\d{2})\s*-\s*(\d{5})\b")
-PFX_RE = re.compile(r"^\s*(\d{2})\s*$")
-BODY_RE = re.compile(r"^\s*(\d{5})\s*$")
-
+# =====================================================
+# SAFE SHARED FILE READS
+# =====================================================
 # 1 = always read a copied file (cached first), 0 = try direct then fallback
 SAFE_SHARED_FILE_READS = 1
 
 
 # =====================================================
-# Shared description parsing helper
+# REGEX HELPERS
 # =====================================================
-_PARSER_CFG = None
+PB_RE = re.compile(r"\b(\d{2})\s*-\s*(\d{5})\b")
+PFX_RE = re.compile(r"^\s*(\d{2})\s*$")
+BODY_RE = re.compile(r"^\s*(\d{5})\s*$")
 
-def _get_parser_cfg(config_path=None):
+
+# =====================================================
+# PARSER CONFIG CACHE
+# =====================================================
+_PARSER_CFG: Optional[Dict[str, Any]] = None
+
+
+def _get_parser_cfg(config_path: Optional[str] = None) -> Dict[str, Any]:
     global _PARSER_CFG
     if _PARSER_CFG is None:
         try:
-            if config_path:
-                _PARSER_CFG = load_config(config_path)
+            if config_path and load_config is not None:
+                _PARSER_CFG = load_config(config_path) or {}
             else:
                 _PARSER_CFG = {}
         except Exception:
@@ -45,7 +68,7 @@ def _get_parser_cfg(config_path=None):
 
 def _parse_desc_fields(desc: str) -> Dict[str, object]:
     desc = safe_str(desc)
-    if not desc:
+    if not desc or parse_description is None:
         return {}
     try:
         parsed = parse_description(desc, _get_parser_cfg()) or {}
@@ -53,14 +76,13 @@ def _parse_desc_fields(desc: str) -> Dict[str, object]:
     except Exception:
         return {}
 
+
 # =====================================================
-# Small helpers
+# SMALL HELPERS
 # =====================================================
-def safe_str(x) -> str:
-    """Convert pandas cell values into clean strings (never NaN)."""
-    # If duplicate headers exist, pandas may return a Series here.
+def safe_str(x: Any) -> str:
+    """Convert pandas cell values into clean strings and collapse duplicate-header Series."""
     if isinstance(x, pd.Series):
-        # pick the first non-empty cell
         for v in x.tolist():
             s = safe_str(v)
             if s:
@@ -74,13 +96,16 @@ def safe_str(x) -> str:
                 return s
         return ""
 
-    if pd.isna(x):
-        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+
     return str(x).strip()
 
 
 def norm_header(h: str) -> str:
-    """Normalize a header to snake_case-ish."""
     return str(h).strip().lower().replace("\n", " ").replace("\r", " ")
 
 
@@ -88,24 +113,13 @@ def norm_header_snake(h: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", norm_header(h)).strip("_")
 
 
-# =====================================================
-# SAFE EXCEL READS (copy-first, cache-first)
-# =====================================================
 def _excel_cache_root() -> str:
-    """
-    Where we store persistent safe copies.
-    Default: %TEMP%/nprtool_excel_cache
-    """
     root = os.path.join(tempfile.gettempdir(), "nprtool_excel_cache")
     os.makedirs(root, exist_ok=True)
     return root
 
 
 def _file_fingerprint(path: str) -> str:
-    """
-    Fast fingerprint for cache key: basename + size + mtime_ns.
-    Good enough to detect edits without hashing entire file.
-    """
     p = Path(path)
     st = p.stat()
     raw = f"{p.name}|{st.st_size}|{st.st_mtime_ns}".encode("utf-8", errors="ignore")
@@ -115,15 +129,10 @@ def _file_fingerprint(path: str) -> str:
 def _cached_copy_path(path: str) -> str:
     src = Path(path)
     fp = _file_fingerprint(path)
-    # keep extension (.xlsx, .xlsm, etc.)
     return os.path.join(_excel_cache_root(), f"{src.stem}__{fp}{src.suffix}")
 
 
 def _ensure_cached_copy(path: str) -> str:
-    """
-    Ensure a cached copy exists and return its path.
-    Never opens the original in pandas/openpyxl; only copy2 touches it.
-    """
     cached = _cached_copy_path(path)
     if not os.path.exists(cached):
         shutil.copy2(path, cached)
@@ -135,48 +144,35 @@ def read_excel_with_temp_copy(path: str, **read_excel_kwargs) -> pd.DataFrame:
     Excel reader that avoids touching shared files.
 
     Behavior:
-      - If SAFE_SHARED_FILE_READS == 1:
-          * Use a cached copy (persistent) if possible; create it if missing.
-          * Read ONLY from the cached copy.
-      - Else:
-          * Try direct read, and if locked, fall back to a temp copy.
+      - If SAFE_SHARED_FILE_READS=1, always read the cached copy.
+      - If SAFE_SHARED_FILE_READS=0, try original path first, then fall back to temp copy.
     """
     if SAFE_SHARED_FILE_READS:
         safe_path = _ensure_cached_copy(path)
         return pd.read_excel(safe_path, **read_excel_kwargs)
 
-    # Legacy behavior (direct first, then temp fallback)
     try:
         return pd.read_excel(path, **read_excel_kwargs)
     except PermissionError:
         pass
     except OSError as e:
-        # Windows sometimes throws OSError for locked files
         if "Permission denied" not in str(e):
             raise
 
-    tmp_dir = tempfile.mkdtemp(prefix="nprtool_")
-    tmp_path = os.path.join(tmp_dir, os.path.basename(path))
-    shutil.copy2(path, tmp_path)
-    return pd.read_excel(tmp_path, **read_excel_kwargs)
+    safe_path = _ensure_cached_copy(path)
+    return pd.read_excel(safe_path, **read_excel_kwargs)
 
 
 @dataclass(frozen=True)
 class HeaderAliases:
-    """
-    Central alias map (scalable).
-    Later: load this from config/yaml/user input.
-    """
     aliases: Dict[str, str]
 
 
 # =====================================================
-# NPR/BOM Aliases TODO: figure out how to accomlish this is a way that inst just hardcoded exprected values
-#   for now we simply have to add these in manually
+# HEADER ALIASES
 # =====================================================
 DEFAULT_NPR_ALIASES = HeaderAliases(
     aliases={
-        # --- MPN variants ---
         "mfg_p_n": "manufacturer_part_",
         "mfgpn": "manufacturer_part_",
         "mfg_part_number": "manufacturer_part_",
@@ -188,16 +184,11 @@ DEFAULT_NPR_ALIASES = HeaderAliases(
         "mfrpn": "manufacturer_part_",
         "mfr_pn": "manufacturer_part_",
         "mfrp_n": "manufacturer_part_",
-        "mfr_p_n": "manufacturer_part_",    
-
-
-        # MPN numbered columns (treat "1" as the primary MPN)
+        "mfr_p_n": "manufacturer_part_",
         "manufacturer_part_number_1": "manufacturer_part_",
         "manufacturer_part_number1": "manufacturer_part_",
         "mfrpn_1": "manufacturer_part_",
         "mpn_1": "manufacturer_part_",
-
-        # Pre-found alternates (map explicit “2” columns to unique names so we can ingest them all)
         "manufacturer_part_number_2": "manufacturer_part_2",
         "manufacturer_part_number2": "manufacturer_part_2",
         "manufacturer_2_part_number": "manufacturer_part_2",
@@ -208,8 +199,6 @@ DEFAULT_NPR_ALIASES = HeaderAliases(
         "manufacturer_part_number3": "manufacturer_part_3",
         "mpn_3": "manufacturer_part_3",
         "mfrpn_3": "manufacturer_part_3",
-
-        # --- Part number / row identity variants ---
         "elan_part_number": "part_number",
         "part_number_": "part_number",
         "part_number": "part_number",
@@ -219,96 +208,68 @@ DEFAULT_NPR_ALIASES = HeaderAliases(
         "part_no": "part_number",
         "part": "part_number",
         "pno": "part_number",
-        
-
-        # Often a stable BOM row ID
         "reference": "designator",
         "refdes": "designator",
         "designator": "designator",
-        
         "footprint": "footprint",
         "subs_allowed": "subs_allowed",
         "name": "name",
-        
-        # --- Description variants ---
         "description": "item_description",
         "item_description": "item_description",
         "desc": "item_description",
         "title": "item_description",
-
-        # --- Manufacturer / supplier variants ---
         "manufacturer": "manufacturer_name",
         "manufacturer_name": "manufacturer_name",
         "mfr_name": "manufacturer_name",
         "mfg_name": "manufacturer_name",
         "mfr": "manufacturer_name",
-        
         "manufacturer_1": "manufacturer_name",
         "manufacturer1": "manufacturer_name",
-
         "supplier_name": "supplier",
         "vendor": "supplier",
         "supplier": "supplier",
         "distributor": "supplier",
-
-        # --- Quantity variants (kept as raw field, but normalize name anyway) ---
+        "digikey_pn": "supplier",
+        "digikey_part_number": "supplier",
+        "digikey_part_no": "supplier",
+        "quantity_per": "quantity",
         "qty": "quantity",
         "quantity": "quantity",
         "qty4one": "quantity",
-
-        "comment": "comment",
     }
 )
 
-# =====================================================
-# ALTERNATES BASE SHEET (internal base item + many MFGPN rows)
-# =====================================================
 DEFAULT_ALT_ALIASES = HeaderAliases(
     aliases={
-        # Your exact headers (normalized to snake by norm_header_snake)
         "item_number": "itemnum",
         "itemnumber": "itemnum",
         "item_num": "itemnum",
-
         "description": "desc",
         "desc": "desc",
-
         "active": "active",
-
         "mfg_id": "mfgid",
         "mfgid": "mfgid",
-
+        "manufacturer_id": "mfgid",
         "manufacturer_name": "mfgname",
         "manufacturer": "mfgname",
         "mfg_name": "mfgname",
-
         "manufacturer_pn": "mfgpn",
         "manufacturer_part_no": "mfgpn",
         "manufacturer_part_number": "mfgpn",
         "mpn": "mfgpn",
-        # Common master inventory exports use VendorItem / Vendor Item for manufacturer PN
         "vendoritem": "mfgpn",
         "vendor_item": "mfgpn",
         "vendor_part_number": "mfgpn",
-
         "tariff_code": "tariff_code",
         "tariff_rate": "tariff_rate",
-
         "last_cost": "last_cost",
         "standard_cost": "standard_cost",
         "average_cost": "average_cost",
     }
 )
 
-
-
-
-# =====================================================
-# Inventory Aliases (NEW)
-# =====================================================
 DEFAULT_INV_ALIASES = HeaderAliases(
     aliases={
-        # Internal PN
         "itemnumber": "itemnum",
         "item_number": "itemnum",
         "item_no": "itemnum",
@@ -316,23 +277,16 @@ DEFAULT_INV_ALIASES = HeaderAliases(
         "internal_part_number": "itemnum",
         "part_number": "itemnum",
         "pn": "itemnum",
-
-        # Description
         "description": "desc",
         "desc": "desc",
         "item_description": "desc",
-
-        # Manufacturer fields
         "mfgid": "mfgid",
         "mfg_id": "mfgid",
         "manufacturer_id": "mfgid",
-
         "mfgname": "mfgname",
         "mfg_name": "mfgname",
         "manufacturer": "mfgname",
         "manufacturer_name": "mfgname",
-
-        # Manufacturer part number / vendor item
         "vendoritem": "vendoritem",
         "vendor_item": "vendoritem",
         "manufacturer_part_number": "vendoritem",
@@ -340,114 +294,298 @@ DEFAULT_INV_ALIASES = HeaderAliases(
         "mpn": "vendoritem",
         "mfgpn": "vendoritem",
         "mfg_pn": "vendoritem",
+        "primaryvendornumber": "primaryvendornumber",
+        "primary_vendor_number": "primaryvendornumber",
+        "supplier": "primaryvendornumber",
+        "mfgitemcount": "mfgitemcount",
+        "mfg_item_count": "mfgitemcount",
+        "manufacturer_item_count": "mfgitemcount",
+        "lastcost": "lastcost",
+        "last_cost": "lastcost",
+        "standardcost": "standard_cost",
+        "standard_cost": "standard_cost",
+        "stdcost": "standard_cost",
+        "std_cost": "standard_cost",
+        "avgcost": "average_cost",
+        "avg_cost": "average_cost",
+        "average_cost": "average_cost",
+        "revision": "revision",
+        "rev": "revision",
+        "itemleadtime": "itemleadtime",
+        "item_lead_time": "itemleadtime",
+        "lead_time": "itemleadtime",
+        "defaultwhse": "defaultwhse",
+        "default_whse": "defaultwhse",
+        "default_warehouse": "defaultwhse",
+        "totalqty": "totalqty",
+        "total_qty": "totalqty",
+        "qty": "totalqty",
     }
 )
 
 DEFAULT_CNS_ALIASES = HeaderAliases(
     aliases={
-        # Prefix
         "prefix": "prefix",
         "pfx": "prefix",
         "pref": "prefix",
-
-        # Body
         "body": "body",
         "base": "body",
         "series": "body",
         "number": "body",
-
-        # Suffix
         "suffix": "suffix",
         "suf": "suffix",
         "rev": "suffix",
         "variant": "suffix",
-
-        # Description
         "description": "description",
         "desc": "description",
         "item_description": "description",
         "title": "description",
         "comment": "description",
-
-        # Date / Initials
         "date": "date",
         "created": "date",
         "created_date": "date",
         "initials": "initials",
-        "init": "initials",
+        "owner": "initials",
         "author": "initials",
     }
 )
 
+ERP_EXPECTED_HEADERS = [
+    "ItemNumber",
+    "Description",
+    "PrimaryVendorNumber",
+    "VendorItem",
+    "ManufacturerId",
+    "ManufacturerName",
+    "ManufacturerItemCount",
+    "LastCost",
+    "StandardCost",
+    "AverageCost",
+    "Revision",
+    "ItemLeadTime",
+    "DefaultWhse",
+    "TotalQty",
+]
+
+MASTER_EXPECTED_HEADERS = [
+    "ItemNumber",
+    "Description",
+    "Active",
+    "ManufacturerId",
+    "ManufacturerName",
+    "ManufacturerPartNumber",
+    "TariffCode",
+    "TariffRate",
+    "LastCost",
+    "StandardCost",
+    "AverageCost",
+]
+
 
 class DataLoader:
     """
-    Loads Inventory and NPR/BOM Excel files and normalizes them into Part objects.
+    Data loader with legacy-safe Excel handling restored.
 
-    The loader is intentionally *not* the place for matching logic.
-    It should:
-      - read files robustly
-      - resolve headers
-      - normalize strings
-      - preserve raw_fields
-      - attach parsed engineering data (optional but useful for UI)
+    This file owns:
+      - safe workbook reading through cached copies
+      - header row detection for offset Excel exports
+      - alias normalization from real workbook headers into canonical names
+      - conversion into the current canonical row/object models
+
+    This file does not own database persistence.
     """
 
     # =====================================================
-    # MPN CLEANER (handles Excel _x garbage)
+    # GENERIC HELPERS
     # =====================================================
+    @staticmethod
+    def load_excel(path: str, sheet_name: int | str = 0, **kwargs: Any) -> pd.DataFrame:
+        kwargs.setdefault("dtype", object)
+        return read_excel_with_temp_copy(path, sheet_name=sheet_name, **kwargs)
+
+    @staticmethod
+    def validate_headers(df: pd.DataFrame, expected_headers: List[str], table_name: str) -> None:
+        actual = [str(col).strip() for col in df.columns]
+        missing = [h for h in expected_headers if h not in actual]
+        if missing:
+            raise ValueError(f"{table_name} missing required headers: {missing}\nFound headers: {actual}")
+
+    @staticmethod
+    def normalize_cell(value: Any) -> Any:
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except Exception:
+                pass
+        return value
+
+    @staticmethod
+    def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out.columns = [str(col).strip() for col in out.columns]
+        out = out.map(DataLoader.normalize_cell)
+        return out
+
+    @staticmethod
+    def stable_stringify_series(series: pd.Series) -> pd.Series:
+        return series.map(lambda x: "" if x is None else str(x).strip())
+
+    @staticmethod
+    def sha256_text(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def add_key_and_hash(df: pd.DataFrame, key_columns: List[str], hash_columns: List[str]) -> pd.DataFrame:
+        out = df.copy()
+        key_source = out[key_columns].apply(DataLoader.stable_stringify_series, axis=0)
+        out["source_row_key"] = key_source.apply(lambda row: "|".join(row.values.tolist()), axis=1)
+        hash_source = out[hash_columns].apply(DataLoader.stable_stringify_series, axis=0)
+        out["row_hash"] = hash_source.apply(
+            lambda row: DataLoader.sha256_text(json.dumps(row.values.tolist(), ensure_ascii=False)),
+            axis=1,
+        )
+        return out
+
+    @staticmethod
+    def dedupe_incoming(df: pd.DataFrame) -> pd.DataFrame:
+        if "source_row_key" not in df.columns:
+            return df
+        return df.drop_duplicates(subset=["source_row_key"], keep="first").reset_index(drop=True)
+
+    @staticmethod
+    def find_duplicate_source_row_keys(df: pd.DataFrame) -> pd.DataFrame:
+        """Return only rows whose source_row_key appears more than once."""
+        if "source_row_key" not in df.columns or df.empty:
+            return df.iloc[0:0].copy()
+        mask = df["source_row_key"].astype(str).duplicated(keep=False)
+        return df.loc[mask].copy()
+
+    @staticmethod
+    def _report_output_base(path: str) -> Path:
+        src = Path(path)
+        return src.with_name(f"{src.stem}_master_duplicate_source_row_keys")
+
+    @staticmethod
+    def write_duplicate_source_row_key_report(df: pd.DataFrame, path: str) -> None:
+        """
+        Write duplicate Master raw-row identity reports grouped by source_row_key.
+
+        This is a debug/reporting helper only. It does not dedupe or mutate the incoming rows.
+        """
+        dupes = DataLoader.find_duplicate_source_row_keys(df)
+        if dupes.empty:
+            print("[MASTER][DUPLICATE SOURCE_ROW_KEYS] none detected")
+            return
+
+        dupes = dupes.copy()
+        dupes["_row_number"] = range(1, len(dupes) + 1)
+        dupes["_group_size"] = dupes.groupby("source_row_key")["source_row_key"].transform("size")
+
+        sort_cols = [c for c in [
+            "source_row_key",
+            "ItemNumber",
+            "ManufacturerPartNumber",
+            "ManufacturerId",
+            "ManufacturerName",
+            "Description",
+            "_row_number",
+        ] if c in dupes.columns]
+        if sort_cols:
+            dupes = dupes.sort_values(sort_cols, kind="stable")
+
+        base = DataLoader._report_output_base(path)
+        csv_path = base.with_suffix(".csv")
+        txt_path = base.with_suffix(".txt")
+
+        dupes.to_csv(csv_path, index=False)
+
+        grouped = dupes.groupby("source_row_key", sort=False)
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("MASTER duplicate source_row_key report\n")
+            f.write(f"Source file: {path}\n")
+            f.write(f"Duplicate groups: {grouped.ngroups}\n")
+            f.write(f"Duplicate rows: {len(dupes)}\n\n")
+            for i, (key, grp) in enumerate(grouped, start=1):
+                f.write(f"[{i}] source_row_key={key} count={len(grp)}\n")
+                for _, row in grp.iterrows():
+                    payload = {col: safe_str(row[col]) for col in grp.columns if not str(col).startswith("_")}
+                    f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                f.write("\n")
+
+        print(f"[MASTER][DUPLICATE SOURCE_ROW_KEYS] groups={grouped.ngroups} rows={len(dupes)}")
+        print(f"[MASTER][DUPLICATE SOURCE_ROW_KEYS] csv={csv_path}")
+        print(f"[MASTER][DUPLICATE SOURCE_ROW_KEYS] txt={txt_path}")
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        text = safe_str(value)
+        if not text:
+            return None
+        try:
+            return float(text)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        text = safe_str(value)
+        if not text:
+            return None
+        try:
+            return int(float(text))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _source_row_key(*parts: Any) -> str:
+        joined = "|".join([safe_str(p).strip() for p in parts])
+        return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
     @staticmethod
     def clean_mpn(s: str) -> str:
         if not s:
             return ""
         s = str(s)
-        s = re.sub(r"_x[0-9a-fA-F]{4}_", "", s)  # remove Excel encoding
-        s = s.replace("\n", "").replace("\r", "").strip()
-        return s
+        s = re.sub(r"_x[0-9a-fA-F]{4}_", "", s)
+        return s.replace("\n", "").replace("\r", "").strip()
 
-    # =====================================================
-    # MPN KEY NORMALIZER (for alternates lookups)
-    # =====================================================
     @staticmethod
     def norm_mpn_key(s: str) -> str:
-        """
-        Normalization for MFGPN lookups.
-        - Uses existing clean_mpn to strip Excel _x####_ junk.
-        - Uppercases.
-        - Removes whitespace so 'ERJ 3EKF...' matches 'ERJ-3EKF...'
-        """
         s = DataLoader.clean_mpn(s or "")
-        s = re.sub(r"\s+", "", s).upper()
-        return s
+        return re.sub(r"\s+", "", s).upper()
 
     # =====================================================
-    # HEADER FINDERS
+    # HEADER DETECTION / NORMALIZATION
     # =====================================================
     @staticmethod
-    def _find_header_row_by_keywords(df: pd.DataFrame, required_keywords: List[str], scan_rows: int = 20) -> int:
-        """
-        Find a header row by scanning early rows for keywords.
-        Works when header is offset by merged cells / title blocks.
-        """
-        required = [k.lower() for k in required_keywords]
+    def _find_header_row_by_keywords(df: pd.DataFrame, required_keywords: List[str], scan_rows: int = 50) -> int:
+        required = [str(k).strip().lower() for k in required_keywords]
+        best_row: Optional[int] = None
+        best_hits = -1
         for i in range(min(scan_rows, len(df))):
-            row = df.iloc[i].astype(str).str.lower()
-            row_str = " ".join(row)
-            if any(k in row_str for k in required):
-                return i
-        raise ValueError("Could not locate a header row.")
+            row = df.iloc[i].astype(str).str.lower().str.strip()
+            joined = " ".join(row.tolist())
+            hits = sum(1 for k in required if k in joined)
+            if hits > best_hits:
+                best_hits = hits
+                best_row = i
+        if best_row is None or best_hits <= 0:
+            raise ValueError(f"Could not locate a header row using keywords: {required_keywords}")
+        return best_row
 
     @staticmethod
     def _find_npr_header_row(raw: pd.DataFrame, scan_rows: int = 40) -> int:
-        """
-        Detect a likely header row by counting keyword hits.
-        """
         header_keywords = ["mfg", "part", "desc", "manufacturer", "item", "mpn", "qty"]
-        best_row = None
+        best_row: Optional[int] = None
         best_hits = 0
         for i in range(min(scan_rows, len(raw))):
             row = raw.iloc[i].astype(str).str.lower().str.strip()
-            joined = " ".join(row)
+            joined = " ".join(row.tolist())
             hits = sum(k in joined for k in header_keywords)
             if hits > best_hits:
                 best_hits = hits
@@ -456,20 +594,29 @@ class DataLoader:
             raise ValueError("No header row found with recognizable keywords.")
         return best_row
 
-    # =====================================================
-    # CNS WORKBOOK (multi-sheet)
-    # =====================================================
+    @staticmethod
+    def _make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
+        cols = list(df.columns)
+        counts: Dict[str, int] = {}
+        new_cols: List[str] = []
+        for c in cols:
+            base = str(c)
+            n = counts.get(base, 0) + 1
+            counts[base] = n
+            new_cols.append(base if n == 1 else f"{base}_{n}")
+        out = df.copy()
+        out.columns = new_cols
+        return out
+
+    @staticmethod
+    def _normalize_and_alias_columns(df: pd.DataFrame, aliases: HeaderAliases) -> pd.DataFrame:
+        out = df.copy()
+        out.columns = [norm_header_snake(c) for c in out.columns]
+        out.columns = [aliases.aliases.get(c, c) for c in out.columns]
+        return DataLoader._make_unique_columns(out)
+
     @staticmethod
     def _open_excel_file_with_temp_copy(path: str) -> tuple[pd.ExcelFile, str | None]:
-        """
-        For opening the workbook so we can list sheet names.
-        Returns (ExcelFile, tmp_dir_to_cleanup_or_None).
-
-        IMPORTANT:
-          - When SAFE_SHARED_FILE_READS=1, we open the CACHED COPY and attach
-            the path we opened on xf._nprtool_safe_path, so callers can read sheets
-            from the same safe file (never the original).
-        """
         if SAFE_SHARED_FILE_READS:
             safe_path = _ensure_cached_copy(path)
             xf = pd.ExcelFile(safe_path)
@@ -493,140 +640,399 @@ class DataLoader:
         setattr(xf, "_nprtool_safe_path", tmp_path)
         return xf, tmp_dir
 
+    # =====================================================
+    # HEADER RENAMING INTO CANONICAL SCHEMA
+    # =====================================================
+    @staticmethod
+    def _to_canonical_erp_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        rename = {
+            "itemnum": "ItemNumber",
+            "desc": "Description",
+            "primaryvendornumber": "PrimaryVendorNumber",
+            "vendoritem": "VendorItem",
+            "mfgid": "ManufacturerId",
+            "mfgname": "ManufacturerName",
+            "mfgitemcount": "ManufacturerItemCount",
+            "lastcost": "LastCost",
+            "standard_cost": "StandardCost",
+            "average_cost": "AverageCost",
+            "revision": "Revision",
+            "itemleadtime": "ItemLeadTime",
+            "defaultwhse": "DefaultWhse",
+            "totalqty": "TotalQty",
+        }
+        out = out.rename(columns={k: v for k, v in rename.items() if k in out.columns})
+        for col in ERP_EXPECTED_HEADERS:
+            if col not in out.columns:
+                out[col] = ""
+        return out
+
+    @staticmethod
+    def _to_canonical_master_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        rename = {
+            "itemnum": "ItemNumber",
+            "desc": "Description",
+            "active": "Active",
+            "mfgid": "ManufacturerId",
+            "mfgname": "ManufacturerName",
+            "mfgpn": "ManufacturerPartNumber",
+            "tariff_code": "TariffCode",
+            "tariff_rate": "TariffRate",
+            "last_cost": "LastCost",
+            "standard_cost": "StandardCost",
+            "average_cost": "AverageCost",
+        }
+        out = out.rename(columns={k: v for k, v in rename.items() if k in out.columns})
+        for col in MASTER_EXPECTED_HEADERS:
+            if col not in out.columns:
+                out[col] = ""
+        return out
+
+    # =====================================================
+    # INVENTORY LOADERS
+    # =====================================================
+    @staticmethod
+    def load_erp_rows(path: str, sheet_name: int | str = 0) -> List[ERPInventoryRow]:
+        raw = read_excel_with_temp_copy(path, sheet_name=sheet_name, header=None, dtype=str)
+        header_row = DataLoader._find_header_row_by_keywords(
+            raw, required_keywords=["item", "description", "vendor", "qty"], scan_rows=80
+        )
+        df = read_excel_with_temp_copy(path, sheet_name=sheet_name, header=header_row, dtype=str).fillna("")
+        df = DataLoader._normalize_and_alias_columns(df, DEFAULT_INV_ALIASES)
+        df = DataLoader._to_canonical_erp_dataframe(df)
+        df = DataLoader.clean_dataframe(df)
+        DataLoader.validate_headers(df, ERP_EXPECTED_HEADERS, "ERP")
+        df = DataLoader.add_key_and_hash(
+            df,
+            key_columns=["ItemNumber", "VendorItem", "ManufacturerId", "ManufacturerName"],
+            hash_columns=ERP_EXPECTED_HEADERS,
+        )
+        df = DataLoader.dedupe_incoming(df)
+
+        rows: List[ERPInventoryRow] = []
+        for record in df.to_dict(orient="records"):
+            item_number = safe_str(record.get("ItemNumber"))
+            description = safe_str(record.get("Description"))
+            vendor_item = DataLoader.clean_mpn(safe_str(record.get("VendorItem")))
+            if not item_number and not vendor_item and not description:
+                continue
+
+            record = dict(record)
+            rows.append(
+                ERPInventoryRow(
+                    item_number=item_number,
+                    description=description,
+                    primary_vendor_number=safe_str(record.get("PrimaryVendorNumber")),
+                    vendor_item=vendor_item,
+                    manufacturer_id=safe_str(record.get("ManufacturerId")),
+                    manufacturer_name=safe_str(record.get("ManufacturerName")),
+                    manufacturer_item_count=DataLoader._safe_float(record.get("ManufacturerItemCount")),
+                    last_cost=DataLoader._safe_float(record.get("LastCost")),
+                    standard_cost=DataLoader._safe_float(record.get("StandardCost")),
+                    average_cost=DataLoader._safe_float(record.get("AverageCost")),
+                    revision=safe_str(record.get("Revision")),
+                    item_lead_time=DataLoader._safe_float(record.get("ItemLeadTime")),
+                    default_whse=safe_str(record.get("DefaultWhse")),
+                    total_qty=DataLoader._safe_float(record.get("TotalQty")),
+                    source_row_key=safe_str(record.get("source_row_key")),
+                    row_hash=safe_str(record.get("row_hash")),
+                    raw_fields=record,
+                )
+            )
+        return rows
+
+    @staticmethod
+    def load_alternate_master_rows(path: str, sheet_name: int | str = 0) -> List[AlternateMasterRow]:
+        raw = read_excel_with_temp_copy(path, sheet_name=sheet_name, header=None, dtype=str)
+        header_row = DataLoader._find_header_row_by_keywords(
+            raw, required_keywords=["item", "description", "manufacturer", "pn"], scan_rows=80
+        )
+        df = read_excel_with_temp_copy(path, sheet_name=sheet_name, header=header_row, dtype=str).fillna("")
+        df = DataLoader._normalize_and_alias_columns(df, DEFAULT_ALT_ALIASES)
+        df = DataLoader._to_canonical_master_dataframe(df)
+        df = DataLoader.clean_dataframe(df)
+        DataLoader.validate_headers(df, MASTER_EXPECTED_HEADERS, "MASTER")
+        df = DataLoader.add_key_and_hash(
+            df,
+            key_columns=["ItemNumber", "ManufacturerPartNumber", "ManufacturerId", "ManufacturerName"],
+            hash_columns=MASTER_EXPECTED_HEADERS,
+        )
+        DataLoader.write_duplicate_source_row_key_report(df, path)
+
+        rows: List[AlternateMasterRow] = []
+        for record in df.to_dict(orient="records"):
+            item_number = safe_str(record.get("ItemNumber"))
+            description = safe_str(record.get("Description"))
+            mfgpn = DataLoader.clean_mpn(safe_str(record.get("ManufacturerPartNumber")))
+            if not item_number and not mfgpn and not description:
+                continue
+
+            record = dict(record)
+            rows.append(
+                AlternateMasterRow(
+                    item_number=item_number,
+                    description=description,
+                    active=safe_str(record.get("Active")),
+                    manufacturer_id=safe_str(record.get("ManufacturerId")),
+                    manufacturer_name=safe_str(record.get("ManufacturerName")),
+                    manufacturer_part_number=mfgpn,
+                    tariff_code=safe_str(record.get("TariffCode")),
+                    tariff_rate=DataLoader._safe_float(record.get("TariffRate")),
+                    last_cost=DataLoader._safe_float(record.get("LastCost")),
+                    standard_cost=DataLoader._safe_float(record.get("StandardCost")),
+                    average_cost=DataLoader._safe_float(record.get("AverageCost")),
+                    source_row_key=safe_str(record.get("source_row_key")),
+                    row_hash=safe_str(record.get("row_hash")),
+                    raw_fields=record,
+                )
+            )
+        return rows
+
+    # Compatibility names retained for older callers.
+    load_erp_inventory_rows = load_erp_rows
+    load_master_inventory_rows = load_alternate_master_rows
+
+    # =====================================================
+    # COMPANY PART BUNDLING
+    # =====================================================
+    @staticmethod
+    def build_company_part_records(
+        erp_rows: List[ERPInventoryRow],
+        master_rows: List[AlternateMasterRow],
+    ) -> List[CompanyPartRecord]:
+        grouped: Dict[str, CompanyPartRecord] = {}
+        manufacturer_index: Dict[tuple[str, str, str], ManufacturerPartRecord] = {}
+
+        def ensure_company(item_number: str) -> CompanyPartRecord:
+            key = safe_str(item_number)
+            rec = grouped.get(key)
+            if rec is None:
+                rec = CompanyPartRecord(company_part_number=key)
+                grouped[key] = rec
+            return rec
+
+        for erp in erp_rows:
+            cpn = safe_str(erp.item_number)
+            if not cpn:
+                continue
+
+            company = ensure_company(cpn)
+            if erp.description and not company.description:
+                company.description = erp.description
+            if erp.default_whse and not company.default_whse:
+                company.default_whse = erp.default_whse
+            if erp.revision and not company.revision:
+                company.revision = erp.revision
+            if erp.primary_vendor_number and not company.primary_vendor_number:
+                company.primary_vendor_number = erp.primary_vendor_number
+            company.total_qty = float(company.total_qty or 0) + float(erp.total_qty or 0)
+            company.raw_fields.setdefault("erp", []).append(dict(erp.raw_fields or {}))
+
+            if erp.vendor_item or erp.manufacturer_name or erp.manufacturer_id:
+                key = (
+                    cpn,
+                    safe_str(erp.vendor_item),
+                    safe_str(erp.manufacturer_id),
+                )
+                mp = manufacturer_index.get(key)
+                if mp is None:
+                    mp = ManufacturerPartRecord(
+                        company_part_number=cpn,
+                        manufacturer_part_number=safe_str(erp.vendor_item) or cpn,
+                        manufacturer_id=safe_str(erp.manufacturer_id),
+                        manufacturer_name=safe_str(erp.manufacturer_name),
+                        description=erp.description,
+                        item_lead_time=erp.item_lead_time,
+                        last_cost=erp.last_cost,
+                        standard_cost=erp.standard_cost,
+                        average_cost=erp.average_cost,
+                        is_erp_primary=True,
+                        erp_source_row_key=safe_str((erp.raw_fields or {}).get("source_row_key")),
+                        raw_fields=dict(erp.raw_fields or {}),
+                    )
+                    manufacturer_index[key] = mp
+                    company.manufacturer_parts.append(mp)
+
+        seen = set()
+        dupes = []
+        for row in master_rows:
+            key = safe_str(getattr(row, "source_row_key", ""))
+            if not key:
+                continue
+            if key in seen:
+                dupes.append(key)
+            seen.add(key)
+
+        if dupes:
+            print(f"[MASTER][DUPLICATE SOURCE_ROW_KEYS] duplicate rows preserved for reporting/resolution: {len(dupes)}")
+
+        for master in master_rows:
+            cpn = safe_str(master.item_number)
+            if not cpn:
+                continue
+
+            company = ensure_company(cpn)
+            if master.description and not company.description:
+                company.description = master.description
+            company.raw_fields.setdefault("master", []).append(dict(master.raw_fields or {}))
+
+            mpn = safe_str(master.manufacturer_part_number)
+            if not mpn and not master.manufacturer_name and not master.manufacturer_id:
+                continue
+
+            key = (cpn, mpn, safe_str(master.manufacturer_id))
+            mp = manufacturer_index.get(key)
+            if mp is None:
+                mp = ManufacturerPartRecord(
+                    company_part_number=cpn,
+                    manufacturer_part_number=mpn or cpn,
+                    manufacturer_id=safe_str(master.manufacturer_id),
+                    manufacturer_name=safe_str(master.manufacturer_name),
+                    description=master.description,
+                    active=safe_str(master.active),
+                    tariff_code=safe_str(master.tariff_code),
+                    tariff_rate=master.tariff_rate,
+                    last_cost=master.last_cost,
+                    standard_cost=master.standard_cost,
+                    average_cost=master.average_cost,
+                    master_source_row_key=safe_str(master.source_row_key) or safe_str((master.raw_fields or {}).get("source_row_key")),
+                    raw_fields=dict(master.raw_fields or {}),
+                )
+                manufacturer_index[key] = mp
+                company.manufacturer_parts.append(mp)
+
+        return list(grouped.values())
+
+    # =====================================================
+    # BOM / NPR LOADING
+    # =====================================================
+    @staticmethod
+    def load_bom_any(path: str, sheet_name: int | str = 0, aliases: HeaderAliases = DEFAULT_NPR_ALIASES) -> List[NPRPart]:
+        raw = read_excel_with_temp_copy(path, sheet_name=sheet_name, header=None, dtype=str)
+        header_row = DataLoader._find_npr_header_row(raw, scan_rows=60)
+        df = read_excel_with_temp_copy(path, sheet_name=sheet_name, header=header_row, dtype=str).fillna("")
+        df = DataLoader._normalize_and_alias_columns(df, aliases)
+
+        parts: List[NPRPart] = []
+        for _, row in df.iterrows():
+            partnum = safe_str(row.get("part_number", ""))
+            desc = safe_str(row.get("item_description", ""))
+            mfgname = safe_str(row.get("manufacturer_name", ""))
+            mfgpn = DataLoader.clean_mpn(safe_str(row.get("manufacturer_part_", "")))
+            supplier = safe_str(row.get("supplier", ""))
+            quantity_raw = safe_str(row.get("quantity", ""))
+            refdes = safe_str(row.get("designator", ""))
+
+            qty: Optional[float] = None
+            if quantity_raw:
+                try:
+                    qty = float(quantity_raw)
+                except Exception:
+                    qty = None
+
+            if not any([partnum, desc, mfgname, mfgpn, supplier, quantity_raw, refdes]):
+                continue
+
+            raw_fields = {str(c): safe_str(row.get(c, "")) for c in df.columns}
+            parsed = _parse_desc_fields(desc)
+            item_type = safe_str((parsed or {}).get("type", "")) if isinstance(parsed, dict) else ""
+            parts.append(
+                NPRPart(
+                    partnum=partnum,
+                    desc=desc,
+                    qty=qty,
+                    refdes=refdes,
+                    item_type=item_type,
+                    mfgname=mfgname,
+                    mfgpn=mfgpn,
+                    supplier=supplier,
+                    raw_fields=raw_fields,
+                    parsed=parsed if isinstance(parsed, dict) else {},
+                )
+            )
+        return parts
+
+    # =====================================================
+    # CNS WORKBOOK
+    # =====================================================
     @staticmethod
     def _sheet_category(sheet_name: str) -> str:
-        """
-        Best-effort parse of a leading category number like '00', '01', ... '99' from sheet name.
-        Examples: '00 - Resistors' -> '00', '12Capacitors' -> '12'
-        """
         m = re.match(r"^\s*(\d{2})\b", str(sheet_name))
         return m.group(1) if m else ""
 
     @staticmethod
     def load_cns_workbook(path: str, aliases: HeaderAliases = DEFAULT_CNS_ALIASES) -> List[CNSRecord]:
-        """
-        Load CNS workbook across all sheets.
-        We primarily care about Prefix + Body; suffix/description may often be blank or absent.
-
-        Works even if:
-          - header row is offset
-          - columns out of order
-          - some sheets have no clean header: we fallback to scanning for prefix/body patterns
-        """
         xf, tmp_dir = DataLoader._open_excel_file_with_temp_copy(path)
         safe_path = getattr(xf, "_nprtool_safe_path", path)
 
         try:
             records: List[CNSRecord] = []
-
             for sheet in xf.sheet_names:
                 raw = read_excel_with_temp_copy(safe_path, sheet_name=sheet, header=None, dtype=str)
-
-                header_row = None
+                header_row: Optional[int] = None
                 try:
-                    # only require Prefix + Body now
                     header_row = DataLoader._find_header_row_by_keywords(
-                        raw,
-                        required_keywords=["prefix", "body"],
-                        scan_rows=120,
+                        raw, required_keywords=["prefix", "body"], scan_rows=120
                     )
                 except Exception:
                     header_row = None
 
-                # -------------------------
-                # Path A: header-based read
-                # -------------------------
+                cat = DataLoader._sheet_category(sheet)
+
                 if header_row is not None:
                     df = read_excel_with_temp_copy(safe_path, sheet_name=sheet, header=header_row, dtype=str).fillna("")
                     df = DataLoader._normalize_and_alias_columns(df, aliases)
-
-                    cat = DataLoader._sheet_category(sheet)
-
                     for _, row in df.iterrows():
-                        def get(name: str) -> str:
-                            return safe_str(row.get(name, ""))
-
-                        prefix = get("prefix")
-                        body = get("body")
-
-                        # If we don't have prefix/body, skip
+                        prefix = safe_str(row.get("prefix", ""))
+                        body = safe_str(row.get("body", ""))
                         if not prefix or not body:
                             continue
-
-                        # We don't care if suffix/desc are missing; keep them if present
-                        suffix = get("suffix")
-                        desc = get("description")
-
                         records.append(
                             CNSRecord(
                                 prefix=prefix,
                                 body=body,
-                                suffix=suffix,
-                                description=desc,
+                                suffix=safe_str(row.get("suffix", "")),
+                                description=safe_str(row.get("description", "")),
                                 sheet_name=str(sheet),
                                 category=cat,
-                                date=get("date"),
-                                initials=get("initials"),
-                                raw_fields={c: safe_str(row.get(c, "")) for c in df.columns},
+                                date=safe_str(row.get("date", "")),
+                                initials=safe_str(row.get("initials", "")),
+                                raw_fields={str(c): safe_str(row.get(c, "")) for c in df.columns},
                                 parsed={},
                             )
                         )
+                    continue
 
-                    continue  # done with this sheet
-
-                # -------------------------
-                # Path B: fallback scan (no header)
-                # -------------------------
-                cat = DataLoader._sheet_category(sheet)
-
-                # We'll collect unique prefix-body pairs from the sheet
-                seen_pb = set()
-
-                # scan first N rows/cols (fast, sufficient)
+                seen_pb: set[tuple[str, str]] = set()
                 max_rows = min(500, len(raw))
                 max_cols = min(40, raw.shape[1] if raw is not None else 0)
-
                 for i in range(max_rows):
                     row = raw.iloc[i, :max_cols].tolist()
 
-                    # 1) Look for combined "NN-NNNNN" in any cell
                     for cell in row:
                         s = safe_str(cell)
                         if not s:
                             continue
                         m = PB_RE.search(s)
                         if m:
-                            pb = (m.group(1), m.group(2))
-                            if pb not in seen_pb:
-                                seen_pb.add(pb)
+                            pair = (m.group(1), m.group(2))
+                            if pair not in seen_pb:
+                                seen_pb.add(pair)
 
-                    # 2) Look for separate prefix + body in the same row
-                    pfx = None
-                    body = None
-                    for cell in row:
-                        s = safe_str(cell)
-                        if not s:
-                            continue
-                        if pfx is None:
-                            mp = PFX_RE.match(s)
-                            if mp:
-                                pfx = mp.group(1)
-                                continue
-                        if body is None:
-                            mb = BODY_RE.match(s)
-                            if mb:
-                                body = mb.group(1)
-                                continue
-                    if pfx and body:
-                        pb = (pfx, body)
-                        if pb not in seen_pb:
-                            seen_pb.add(pb)
+                    for j in range(len(row) - 1):
+                        left = safe_str(row[j])
+                        right = safe_str(row[j + 1])
+                        if PFX_RE.match(left) and BODY_RE.match(right):
+                            pair = (left.strip(), right.strip())
+                            if pair not in seen_pb:
+                                seen_pb.add(pair)
 
-                # Emit records with empty suffix/description (by design)
-                for pfx, body in seen_pb:
+                for prefix, body in sorted(seen_pb):
                     records.append(
                         CNSRecord(
-                            prefix=pfx,
+                            prefix=prefix,
                             body=body,
                             suffix="",
                             description="",
@@ -639,647 +1045,11 @@ class DataLoader:
                         )
                     )
 
-            print(f" Loaded {len(records)} CNS records from {path}")
             return records
-
         finally:
-            if tmp_dir and os.path.isdir(tmp_dir):
-                try:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                except Exception:
-                    pass
-
-    # ===========================================================
-    # Make columns unique after aliasing (prevents this everywhere)
-    # ===========================================================
-    @staticmethod
-    def _make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        If aliasing creates duplicate column names (common), make them unique by suffixing.
-        Example: item_description, item_description -> item_description, item_description_2
-        """
-        cols = list(df.columns)
-        counts = {}
-        new_cols = []
-        for c in cols:
-            base = str(c)
-            n = counts.get(base, 0) + 1
-            counts[base] = n
-            new_cols.append(base if n == 1 else f"{base}_{n}")
-        df = df.copy()
-        df.columns = new_cols
-        return df
-
-    # =====================================================
-    # INTERNAL: normalize + alias dataframe columns
-    # =====================================================
-    @staticmethod
-    def _normalize_and_alias_columns(df: pd.DataFrame, aliases: HeaderAliases) -> pd.DataFrame:
-        df = df.copy()
-        df.columns = [norm_header_snake(c) for c in df.columns]
-        df.columns = [aliases.aliases.get(c, c) for c in df.columns]
-        df = DataLoader._make_unique_columns(df)
-        return df
-
-    # =====================================================
-    # INVENTORY SHEET
-    # =====================================================
-    @staticmethod
-    def load_inventory(path: str, aliases: HeaderAliases = DEFAULT_INV_ALIASES) -> List[InventoryPart]:
-        """
-        Load inventory file and return a list of InventoryPart objects.
-        Robust against header naming changes via normalization + aliasing.
-        """
-        raw = read_excel_with_temp_copy(path, header=None, dtype=str)
-
-        header_row = DataLoader._find_header_row_by_keywords(
-            raw,
-            required_keywords=["item", "desc", "vendor", "mfg", "manufacturer"],
-            scan_rows=30,
-        )
-
-        df = read_excel_with_temp_copy(path, header=header_row, dtype=str).fillna("")
-        df = DataLoader._normalize_and_alias_columns(df, aliases)
-
-        # Minimal sanity: must have an internal PN or vendor item or description
-        has_any_id = any(c in df.columns for c in ["itemnum", "vendoritem", "desc"])
-        if not has_any_id:
-            raise ValueError(f" Inventory sheet missing core columns. Detected: {list(df.columns)}")
-
-        inventory_parts: List[InventoryPart] = []
-        for _, row in df.iterrows():
-            raw_fields = {col: safe_str(row.get(col, "")) for col in df.columns}
-
-            itemnum = safe_str(row.get("itemnum", ""))
-            desc = safe_str(row.get("desc", ""))
-            vendoritem = DataLoader.clean_mpn(safe_str(row.get("vendoritem", "")))
-
-            # Skip blank-enough inventory rows (prevents garbage candidates)
-            if not itemnum and not vendoritem and not desc:
-                continue
-
-            inv = InventoryPart(
-                itemnum=itemnum,
-                desc=desc,
-                mfgid=safe_str(row.get("mfgid", "")),
-                mfgname=safe_str(row.get("mfgname", "")),
-                vendoritem=vendoritem,
-                raw_fields=raw_fields,
-                parsed=_parse_desc_fields(desc),
-            )
-            inventory_parts.append(inv)
-
-        return inventory_parts
-
-
-
-    @staticmethod
-    def load_master_inventory(
-        path: str,
-        *,
-        inv_aliases: HeaderAliases = DEFAULT_INV_ALIASES,
-        alt_aliases: HeaderAliases = DEFAULT_ALT_ALIASES,
-    ) -> tuple[List[InventoryPart], Dict[str, List[SubstitutePart]], Dict[str, List[str]]]:
-        """
-        Load the **master inventory** sheet (previously 'alternates' sheet) and convert it into:
-
-          1) A *deduplicated* inventory list keyed by **company/internal item number** (itemnum)
-             - exactly one InventoryPart per itemnum (the first row becomes the "representative")
-          2) A substitutes mapping (base_itemnum -> [SubstitutePart...]) built from additional rows
-             for the same itemnum, each with a different manufacturer part number (mfgpn)
-          3) An MPN index (normalized_mfgpn -> [base_itemnum...]) for deterministic resolution and
-             conflict detection (same MPN appears under multiple base items).
-
-        This makes alternates tied to **company part number (itemnum)**, NOT grouped under a single MPN.
-        """
-        # Read raw to find headers robustly (the master sheet may not have row-0 headers)
-        raw = read_excel_with_temp_copy(path, header=None, dtype=str)
-
-        # Prefer the alternates-style header search (item/description/manufacturer/pn)
-        header_row = DataLoader._find_header_row_by_keywords(
-            raw,
-            required_keywords=["item", "description", "manufacturer", "pn"],
-            scan_rows=50,
-        )
-
-        df = read_excel_with_temp_copy(path, header=header_row, dtype=str).fillna("")
-        df = DataLoader._normalize_and_alias_columns(df, alt_aliases)
-
-        if "itemnum" not in df.columns or "mfgpn" not in df.columns:
-            raise ValueError(f"Master inventory missing required columns. Detected: {list(df.columns)}")
-
-        inv_by_item: Dict[str, InventoryPart] = {}
-        subs_by_base: Dict[str, List[SubstitutePart]] = {}
-        mpn_to_base: Dict[str, List[str]] = {}
-
-        for _, row in df.iterrows():
-            base_item = safe_str(row.get("itemnum", "")).strip()
-            desc = safe_str(row.get("desc", "")).strip()
-            mfgpn = DataLoader.clean_mpn(safe_str(row.get("mfgpn", "")).strip())
-            mfgname = safe_str(row.get("mfgname", "")).strip()
-            mfgid = safe_str(row.get("mfgid", "")).strip()
-
-            if not base_item:
-                continue
-
-            if base_item not in inv_by_item:
-                rep_vendoritem = mfgpn or ""
-                raw_fields = {str(k): safe_str(v) for k, v in dict(row).items()}
-                inv_by_item[base_item] = InventoryPart(
-                    itemnum=base_item,
-                    desc=desc,
-                    mfgid=mfgid,
-                    mfgname=mfgname,
-                    vendoritem=rep_vendoritem,
-                    raw_fields=raw_fields,
-                    parsed=_parse_desc_fields(desc),
-                )
-                subs_by_base.setdefault(base_item, [])
-
-            # Treat additional MPN rows as substitutes (but not the representative MPN)
-            if mfgpn:
-                rep = (inv_by_item[base_item].vendoritem or "").strip()
-                if not rep:
-                    inv_by_item[base_item].vendoritem = mfgpn
-                    rep = mfgpn
-
-                if DataLoader.norm_mpn_key(mfgpn) != DataLoader.norm_mpn_key(rep):
-                    sub = SubstitutePart(
-                        base_itemnum=base_item,
-                        sub_itemnum="",
-                        description=desc,
-                        mfgpn=mfgpn,
-                        notes=(mfgname or "").strip(),
-                    )
-                    subs_by_base.setdefault(base_item, []).append(sub)
-                    try:
-                        inv_by_item[base_item].add_substitute(sub)
-                    except Exception:
-                        inv_by_item[base_item].substitutes.append(sub)
-
-                key = DataLoader.norm_mpn_key(mfgpn)
-                if key:
-                    mpn_to_base.setdefault(key, [])
-                    if base_item not in mpn_to_base[key]:
-                        mpn_to_base[key].append(base_item)
-
-        # Also index the representative MPN for each base item
-        for base_item, inv in inv_by_item.items():
-            rep = (getattr(inv, "vendoritem", "") or "").strip()
-            key = DataLoader.norm_mpn_key(rep)
-            if key:
-                mpn_to_base.setdefault(key, [])
-                if base_item not in mpn_to_base[key]:
-                    mpn_to_base[key].append(base_item)
-
-        return list(inv_by_item.values()), subs_by_base, mpn_to_base
-
-    @staticmethod
-    def load_alternates_db(
-        path: str,
-        aliases: HeaderAliases = DEFAULT_ALT_ALIASES
-    ) -> tuple[Dict[str, List[SubstitutePart]], Dict[str, List[str]]]:
-        """
-        Load the alternates base sheet.
-
-        Returns:
-          subs_by_base: base_itemnum -> [SubstitutePart...]
-          mpn_to_base:  normalized_mfgpn -> [base_itemnum,...]  (list to detect conflicts)
-        """
-        raw = read_excel_with_temp_copy(path, header=None, dtype=str)
-
-        header_row = DataLoader._find_header_row_by_keywords(
-            raw,
-            required_keywords=["item", "description", "manufacturer", "pn"],
-            scan_rows=50,
-        )
-
-        df = read_excel_with_temp_copy(path, header=header_row, dtype=str).fillna("")
-        df = DataLoader._normalize_and_alias_columns(df, aliases)
-
-        # sanity
-        if "itemnum" not in df.columns or "mfgpn" not in df.columns:
-            raise ValueError(f"Alternates DB missing required columns. Detected: {list(df.columns)}")
-
-        subs_by_base: Dict[str, List[SubstitutePart]] = {}
-        mpn_to_base: Dict[str, List[str]] = {}
-
-        for _, row in df.iterrows():
-            base_item = safe_str(row.get("itemnum", "")).strip()
-            desc = safe_str(row.get("desc", "")).strip()
-            mfgpn = safe_str(row.get("mfgpn", "")).strip()
-            mfgname = safe_str(row.get("mfgname", "")).strip()
-
-            if not base_item or not mfgpn:
-                continue
-            
-            # Create a SubstitutePart entry (sub_itemnum is unknown in this sheet, so keep "")
-            sub = SubstitutePart(
-                base_itemnum=base_item,
-                sub_itemnum="",
-                description=desc,
-                mfgpn=mfgpn,
-                notes=(mfgname or "").strip(),
-            )
-            subs_by_base.setdefault(base_item, []).append(sub)
-
-            key = DataLoader.norm_mpn_key(mfgpn)
-            if key:
-                mpn_to_base.setdefault(key, [])
-                if base_item not in mpn_to_base[key]:
-                    mpn_to_base[key].append(base_item)
-
-        return subs_by_base, mpn_to_base
-
-
-    # =====================================================
-    # NEW (v2 schema): Inventory Company Snapshot Builders
-    # =====================================================
-    @staticmethod
-    def load_erp_stock_totals(path: str) -> Dict[str, int]:
-        """Load ERP inventory sheet and return {itemnum/cpn -> stock_total}.
-
-        This function is intentionally defensive: ERP extracts vary a lot.
-        We detect the header row by keywords and then look for a likely
-        stock/on-hand column.
-        """
-        raw = read_excel_with_temp_copy(path, header=None, dtype=str)
-
-        header_row = DataLoader._find_header_row_by_keywords(
-            raw,
-            required_keywords=["item"],
-            scan_rows=50,
-        )
-
-        df = read_excel_with_temp_copy(path, header=header_row, dtype=str).fillna("")
-        df.columns = [norm_header_snake(c) for c in df.columns]
-        df = DataLoader._make_unique_columns(df)
-
-        # Identify the CPN/itemnum column
-        item_col = None
-        for c in df.columns:
-            if c in ("itemnum","ItemNumber", "item_number", "itemnumber"):
-                item_col = c
-                break
-        if item_col is None:
-            # fallback: first column containing 'item'
-            for c in df.columns:
-                if "item" in str(c):
-                    item_col = c
-                    break
-        if item_col is None:
-            raise ValueError(f"ERP inventory: could not identify item number column. Columns={list(df.columns)}")
-
-        # Identify a stock/on-hand column
-        stock_col = None
-        candidates = [
-            "TotalQty", "qty", "Total_Qty"
-        ]
-        for c in candidates:
-            if c in df.columns:
-                stock_col = c
-                break
-        if stock_col is None:
-            # fuzzy: any column containing both qty/quantity and hand/avail/stock
-            for c in df.columns:
-                lc = str(c).lower()
-                if ("qty" in lc or "quantity" in lc):
-                    stock_col = c
-                    break
-        if stock_col is None:
-            raise ValueError(f"ERP inventory: could not identify stock/on-hand column. Columns={list(df.columns)}")
-
-        out: Dict[str, int] = {}
-        for _, row in df.iterrows():
-            itemnum = safe_str(row.get(item_col, "")).strip()
-            if not itemnum:
-                continue
-            raw_qty = safe_str(row.get(stock_col, ""))
             try:
-                qty = int(float(raw_qty)) if raw_qty else 0
+                xf.close()
             except Exception:
-                qty = 0
-            out[itemnum] = out.get(itemnum, 0) + qty
-        return out
-
-    @staticmethod
-    def build_inventory_company_parts(
-        master_inventory_path: str,
-        *,
-        erp_inventory_path: Optional[str] = None,
-        alt_aliases: HeaderAliases = DEFAULT_ALT_ALIASES,
-        progress_cb: Optional[Callable[[int, int, str], None]] = None,
-        parse_workers: int = 8,
-    ) -> tuple[List[dict], List[InventoryPart]]:
-        """Build inventory_company rows for DB persistence + a flat InventoryPart list for matching.
-
-        Returns:
-          company_parts_rows: list[dict] matching InventoryCompanyRepo.upsert_company_parts() contract
-          flat_inventory:     list[InventoryPart] (one per alternate) for MatchingEngine compatibility
-        """
-        raw = read_excel_with_temp_copy(master_inventory_path, header=None, dtype=str)
-
-        header_row = DataLoader._find_header_row_by_keywords(
-            raw,
-            required_keywords=["item", "description", "manufacturer", "pn", "vendor"],
-            scan_rows=50,
-        )
-
-        df = read_excel_with_temp_copy(master_inventory_path, header=header_row, dtype=str).fillna("")
-        df = DataLoader._normalize_and_alias_columns(df, alt_aliases)
-
-        if "mfgpn" not in df.columns:
-            for c in list(df.columns):
-                lc = str(c).strip().lower()
-                if lc in ("vendoritem", "vendor_item", "vendor_part_number"):
-                    df = df.copy()
-                    df["mfgpn"] = df[c]
-                    break
-
-        if "itemnum" not in df.columns:
-            raise ValueError(f"Master inventory missing itemnum column. Detected: {list(df.columns)}")
-
-        stock_totals: Dict[str, int] = {}
-        if erp_inventory_path:
-            try:
-                stock_totals = DataLoader.load_erp_stock_totals(erp_inventory_path)
-            except Exception as e:
-                print(f"[WARN] ERP stock load failed ({erp_inventory_path}): {e}")
-
-        grouped: Dict[str, dict] = {}
-        flat: List[InventoryPart] = []
-
-        def _as_float(x: str) -> Optional[float]:
-            x = (x or "").strip()
-            if not x:
-                return None
-            try:
-                return float(x)
-            except Exception:
-                return None
-
-        unique_descs = sorted({
-            safe_str(row.get("desc", "")).strip()
-            for _, row in df.iterrows()
-            if safe_str(row.get("desc", "")).strip()
-        })
-
-        parsed_cache: Dict[str, Dict[str, object]] = {}
-        if unique_descs:
-            total_descs = len(unique_descs)
-            workers = max(1, int(parse_workers or 1))
-            if workers == 1 or total_descs == 1:
-                for i, desc in enumerate(unique_descs, start=1):
-                    parsed_cache[desc] = _parse_desc_fields(desc)
-                    if progress_cb:
-                        progress_cb(i, total_descs, f"Parsing descriptions {i}/{total_descs}")
-            else:
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    future_to_desc = {ex.submit(_parse_desc_fields, desc): desc for desc in unique_descs}
-                    done = 0
-                    for fut in as_completed(future_to_desc):
-                        desc = future_to_desc[fut]
-                        try:
-                            parsed_cache[desc] = fut.result() or {}
-                        except Exception:
-                            parsed_cache[desc] = {}
-                        done += 1
-                        if progress_cb:
-                            progress_cb(done, total_descs, f"Parsing descriptions {done}/{total_descs}")
-
-        total_rows = len(df.index)
-        for row_num, (_, row) in enumerate(df.iterrows(), start=1):
-            cpn = safe_str(row.get("itemnum", "")).strip()
-            if not cpn:
-                continue
-
-            desc = safe_str(row.get("desc", "")).strip()
-            parsed = parsed_cache.get(desc, {}) if desc else {}
-            mfgname = safe_str(row.get("mfgname", "")).strip()
-            mfgid = safe_str(row.get("mfgid", "")).strip()
-            mpn = DataLoader.clean_mpn(safe_str(row.get("mfgpn", "") or row.get("vendoritem", "")))
-
-            tariff_code = safe_str(row.get("tariff_code", "")).strip()
-            tariff_rate = _as_float(safe_str(row.get("tariff_rate", "")))
-            last_cost = _as_float(safe_str(row.get("last_cost", "")))
-            standard_cost = _as_float(safe_str(row.get("standard_cost", "")))
-            average_cost = _as_float(safe_str(row.get("average_cost", "")))
-
-            if cpn not in grouped:
-                grouped[cpn] = {
-                    "cpn": cpn,
-                    "canonical_desc": desc,
-                    "parsed": parsed,
-                    "stock_total": int(stock_totals.get(cpn, 0) or 0),
-                    "alternates": [],
-                }
-            else:
-                if desc and not grouped[cpn].get("canonical_desc"):
-                    grouped[cpn]["canonical_desc"] = desc
-                if parsed and not grouped[cpn].get("parsed"):
-                    grouped[cpn]["parsed"] = parsed
-
-            if mpn or mfgname or mfgid:
-                grouped[cpn]["alternates"].append(
-                    {
-                        "mfgname": mfgname,
-                        "mfgid": mfgid,
-                        "mpn": mpn,
-                        "unit_price": average_cost if average_cost is not None else last_cost,
-                        "last_unit_price": last_cost,
-                        "standard_cost": standard_cost,
-                        "average_cost": average_cost,
-                        "tariff_code": tariff_code,
-                        "tariff_rate": tariff_rate,
-                        "meta": {k: safe_str(row.get(k, "")) for k in df.columns},
-                    }
-                )
-
-                flat.append(
-                    InventoryPart(
-                        itemnum=cpn,
-                        desc=desc,
-                        mfgid=mfgid,
-                        mfgname=mfgname,
-                        vendoritem=mpn,
-                        raw_fields={k: safe_str(row.get(k, "")) for k in df.columns},
-                        parsed=parsed,
-                    )
-                )
-
-            if progress_cb and (row_num % 100 == 0 or row_num == total_rows):
-                progress_cb(row_num, total_rows, f"Building company inventory {row_num}/{total_rows}")
-
-        for cpn, qty in (stock_totals or {}).items():
-            if cpn not in grouped:
-                grouped[cpn] = {
-                    "cpn": cpn,
-                    "canonical_desc": "",
-                    "parsed": {},
-                    "stock_total": int(qty or 0),
-                    "alternates": [],
-                }
-            else:
-                grouped[cpn]["stock_total"] = int(qty or 0)
-
-        return list(grouped.values()), flat
-
-    # =====================================================
-    # NPR / BOM SHEET
-    # =====================================================
-    @staticmethod
-    def load_npr(path: str, aliases: HeaderAliases = DEFAULT_NPR_ALIASES) -> List[NPRPart]:
-        """
-        Robust loader for BOM/NPR sheets:
-        - detects offset headers
-        - normalizes headers to snake_case
-        - applies alias mapping
-        - preserves raw_fields
-        - ingests multiple MPN columns (pre-found alternates)
-           deterministic: primary is manufacturer_part_, alternates are manufacturer_part_2+
-        - guarantees unique partnum fallback (ROW-#)
-        - drops blank-enough rows
-        """
-        raw = read_excel_with_temp_copy(path, header=None, dtype=str)
-
-        try:
-            header_row = DataLoader._find_npr_header_row(raw)
-        except Exception as e:
-            print(f" Header not found: {e}. Defaulting to row 0.")
-            header_row = 0
-
-        df = read_excel_with_temp_copy(path, header=header_row, dtype=str).fillna("")
-
-        # Retry if mostly unnamed columns
-        unnamed_ratio = sum(str(c).lower().startswith("unnamed") for c in df.columns) / max(1, len(df.columns))
-        if unnamed_ratio > 0.5 and header_row < len(raw) - 1:
-            print(f" Mostly unnamed columns at row {header_row}, retrying with next row...")
-            header_row += 1
-            df = read_excel_with_temp_copy(path, header=header_row, dtype=str).fillna("")
-
-        # Normalize + alias headers (+ make unique in your _normalize_and_alias_columns)
-        df = DataLoader._normalize_and_alias_columns(df, aliases)
-
-        print(f" Normalized Columns: {list(df.columns)}")
-
-        # Validate minimal required fields
-        has_desc = any("item_description" == c for c in df.columns)
-        has_mpn = any(str(c).startswith("manufacturer_part_") for c in df.columns)
-        if not has_desc and not has_mpn:
-            raise ValueError(
-                " Unable to find Description or Manufacturer Part columns in sheet.\n"
-                f"Detected columns: {list(df.columns)}"
-            )
-
-        # --- Patch B v2: deterministic primary + alternates ---
-        primary_col = "manufacturer_part_" if "manufacturer_part_" in df.columns else None
-
-        alt_cols = [
-            c for c in df.columns
-            if str(c).startswith("manufacturer_part_") and c != "manufacturer_part_"
-        ]
-
-        def _mpn_suffix_key(col: str) -> int:
-            # manufacturer_part_2 < manufacturer_part_10
-            m = re.search(r"manufacturer_part_(\d+)$", str(col))
-            return int(m.group(1)) if m else 999999
-
-        alt_cols = sorted(alt_cols, key=_mpn_suffix_key)
-
-        npr_parts: List[NPRPart] = []
-        for i, (_, row) in enumerate(df.iterrows(), start=1):
-
-            def get(name: str) -> str:
-                return safe_str(row.get(name, ""))
-
-            # Prefer Description; fall back to Comment if you keep that column separate
-            desc = get("item_description") or get("comment")
-
-            primary_mpn = DataLoader.clean_mpn(get(primary_col)) if primary_col else ""
-            alt_mpns = [DataLoader.clean_mpn(get(c)) for c in alt_cols]
-            alt_mpns = [m for m in alt_mpns if m]
-
-            # guarantee a unique identifier for node creation downstream
-            partnum = get("part_number") or f"ROW-{i}"
-
-            # drop blank-enough BOM rows
-            if not desc and not primary_mpn and not alt_mpns:
-                continue
-
-            parsed = _parse_desc_fields(desc)
-            if alt_mpns:
-                parsed["mpn_alts"] = alt_mpns
-
-            npr = NPRPart(
-                partnum=partnum,
-                desc=desc,
-                mfgname=get("manufacturer_name"),
-                mfgpn=primary_mpn,
-                supplier=get("supplier"),
-                raw_fields={c: safe_str(row.get(c, "")) for c in df.columns},
-                parsed=parsed,
-            )
-            npr_parts.append(npr)
-
-        print(f" Loaded {len(npr_parts)} NPR/BOM parts successfully from {path}")
-        return npr_parts
-
-    # =====================================================
-    # wrapper that falls back automatically
-    # =====================================================
-    @staticmethod
-    def load_bom_any(path: str, aliases: HeaderAliases = DEFAULT_NPR_ALIASES) -> List[NPRPart]:
-        """
-        Try the full NPR/BOM loader; if it can't parse core columns,
-        fallback to the simple parts-list loader.
-        """
-        try:
-            return DataLoader.load_npr(path, aliases=aliases)
-        except Exception as e:
-            print(f"load_npr failed ({e}). Falling back to load_simple_parts_list...")
-            return DataLoader.load_simple_parts_list(path)
-
-    # =====================================================
-    # SIMPLE 2-COLUMN PARTS LIST 
-    # =====================================================
-    @staticmethod
-    def load_simple_parts_list(path: str) -> List[NPRPart]:
-        """
-        Fallback for minimal Excel lists with no consistent header structure.
-        """
-        df = read_excel_with_temp_copy(path, dtype=str).fillna("")
-        normalized = [norm_header_snake(c) for c in df.columns]
-
-        desc_col: Optional[str] = None
-        mpn_col: Optional[str] = None
-        for orig, norm in zip(df.columns, normalized):
-            if ("desc" in norm or "title" in norm or "description" in norm) and desc_col is None:
-                desc_col = orig
-            if any(k in norm for k in ["part", "mpn", "mfg", "pn", "p_n"]) and mpn_col is None:
-                mpn_col = orig
-
-        if not desc_col and not mpn_col:
-            raise ValueError(f"Could not find description or MPN columns. Detected: {list(df.columns)}")
-
-        parts: List[NPRPart] = []
-        for i, (_, row) in enumerate(df.iterrows(), start=1):
-            desc_val = safe_str(row.get(desc_col or "", ""))
-            mpn_raw = safe_str(row.get(mpn_col or "", ""))
-            mpn_val = DataLoader.clean_mpn(mpn_raw)
-
-            # drop blank-enough rows
-            if not desc_val and not mpn_val:
-                continue
-
-            parts.append(
-                NPRPart(
-                    partnum=f"ROW-{i}",  #  unique id
-                    desc=desc_val,
-                    mfgname="",
-                    mfgpn=mpn_val,
-                    supplier="",
-                    raw_fields={str(k): safe_str(v) for k, v in dict(row).items()},
-                    parsed=_parse_desc_fields(desc_val),
-                )
-            )
-        return parts
+                pass
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)

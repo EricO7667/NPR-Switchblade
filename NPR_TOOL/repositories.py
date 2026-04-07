@@ -8,8 +8,22 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .data_models import CompanyPartRecord, ManufacturerPartRecord, MatchResult, MatchType, NPRPart, InventoryPart
+
 _DB_LOCK = threading.RLock()
 
+"""
+Repository layer responsibilities:
+- DataLoader reads Excel and produces normalized Python objects.
+- db.py defines the SQLite schema.
+- repositories.py is the only layer that turns those Python objects into SQL
+  writes and turns SQL rows back into Python objects.
+
+Why keep this separate:
+- The loader should not know SQL.
+- The schema file should not contain business read/write logic.
+- The controller/UI can call repository methods without hand-writing SQL.
+"""
 
 # -----------------------------
 # helpers
@@ -266,6 +280,31 @@ class BomRepo:
             out.append(d)
         return out
 
+
+
+    def list_input_parts(self, workspace_id: str) -> List[NPRPart]:
+        """Hydrate bom_line_input rows into NPRPart runtime objects for matching."""
+        parts: List[NPRPart] = []
+        for row in self.list_inputs(workspace_id):
+            raw_json = row.get("raw_json") or {}
+            raw_fields = dict(raw_json.get("raw_fields") or {}) if isinstance(raw_json, dict) else {}
+            parsed = dict(raw_json.get("parsed") or {}) if isinstance(raw_json, dict) else {}
+            parts.append(
+                NPRPart(
+                    partnum=str(row.get("partnum", "") or ""),
+                    desc=str(row.get("description", "") or ""),
+                    qty=_as_float_or_none(row.get("qty")),
+                    refdes=str(row.get("refdes", "") or ""),
+                    item_type=str(row.get("item_type", "") or ""),
+                    mfgname=str(row.get("mfgname", "") or ""),
+                    mfgpn=str(row.get("mfgpn", "") or ""),
+                    supplier=str(row.get("supplier", "") or ""),
+                    raw_fields=raw_fields,
+                    parsed=parsed,
+                )
+            )
+        return parts
+
     def get_input(self, workspace_id: str, input_line_id: int) -> Optional[Dict[str, Any]]:
         row = self.conn.execute(
             """
@@ -438,357 +477,279 @@ class BomRepo:
         self.patch_state(workspace_id, line_id, patch)
 
 
+
 # =============================================================================
-# InventoryCompanyRepo + InventoryCompanyItemRepo
+# Inventory repositories
 # =============================================================================
-class InventoryCompanyRepo:
+# This is the active inventory persistence layer.
+#
+# The flow is:
+#   Excel -> DataLoader normalized objects -> repository writes -> SQLite tables
+#
+# These classes own SQL for the new normalized inventory schema only.
+# The old compatibility repository aliases were removed on purpose.
+# =============================================================================
+class CompanyPartRepo:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
-    def upsert_company_parts(
+    @staticmethod
+    def _row_to_company(row: sqlite3.Row) -> CompanyPartRecord:
+        return CompanyPartRecord(
+            company_part_id=row['company_part_id'],
+            company_part_number=str(row['company_part_number'] or ''),
+            description=str(row['description'] or ''),
+            default_whse=str(row['default_whse'] or ''),
+            total_qty=_as_float_or_none(row['total_qty']),
+            revision=str(row['revision'] or ''),
+            primary_vendor_number=str(row['primary_vendor_number'] or ''),
+            updated_at=str(row['updated_at'] or ''),
+            last_seen_at=str(row['imported_at'] or ''),
+            raw_fields=json_loads(row['raw_json'], default={}),
+        )
+
+    def get(self, workspace_id: str, company_part_number: str) -> Optional[CompanyPartRecord]:
+        row = self.conn.execute(
+            "SELECT * FROM company_part WHERE workspace_id = ? AND company_part_number = ?;",
+            (workspace_id, str(company_part_number or '')),
+        ).fetchone()
+        if not row:
+            return None
+        company = self._row_to_company(row)
+        company.manufacturer_parts = ManufacturerPartRepo(self.conn).list_for_company_part_id(workspace_id, company.company_part_id)
+        return company
+
+    def list(self, workspace_id: str) -> List[CompanyPartRecord]:
+        rows = self.conn.execute(
+            "SELECT * FROM company_part WHERE workspace_id = ? ORDER BY company_part_number ASC;",
+            (workspace_id,),
+        ).fetchall()
+        out = [self._row_to_company(r) for r in rows]
+        part_repo = ManufacturerPartRepo(self.conn)
+        for company in out:
+            company.manufacturer_parts = part_repo.list_for_company_part_id(workspace_id, company.company_part_id)
+        return out
+
+    def replace_for_workspace(
         self,
         workspace_id: str,
-        parts: Sequence[Dict[str, Any]],
+        company_parts: Sequence[CompanyPartRecord],
         *,
         imported_at: Optional[str] = None,
-    ) -> None:
-        """
-        parts: [{cpn, canonical_desc, stock_total, alternates}] where alternates is list[dict]
-        Also maintains inventory_company_item (row-per-alt) for UI.
-        """
+    ) -> Dict[str, int]:
         imported_at = imported_at or _now_iso()
-
+        stats = {'company_parts': 0, 'manufacturer_parts': 0}
         with _DB_LOCK, self.conn:
-            for p in parts:
-                cpn = str(p.get("cpn", "") or "").strip()
+            self.conn.execute('DELETE FROM manufacturer_part WHERE workspace_id = ?;', (workspace_id,))
+            self.conn.execute('DELETE FROM company_part WHERE workspace_id = ?;', (workspace_id,))
+            for cp in (company_parts or []):
+                cpn = str(getattr(cp, 'company_part_number', '') or '').strip()
                 if not cpn:
                     continue
-
-                canonical_desc = str(p.get("canonical_desc", "") or "")
-                stock_total = int(p.get("stock_total", 0) or 0)
-                alternates = p.get("alternates", []) or []
-                if not isinstance(alternates, list):
-                    alternates = []
-
-                # base snapshot
-                self.conn.execute(
+                cur = self.conn.execute(
                     """
-                    INSERT INTO inventory_company (
-                        workspace_id, cpn,
-                        canonical_desc, stock_total,
-                        alternates_json,
-                        imported_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(workspace_id, cpn) DO UPDATE SET
-                        canonical_desc=excluded.canonical_desc,
-                        stock_total=excluded.stock_total,
-                        alternates_json=excluded.alternates_json,
-                        imported_at=excluded.imported_at;
+                    INSERT INTO company_part (
+                        workspace_id, company_part_number, description, default_whse,
+                        total_qty, revision, primary_vendor_number, raw_json,
+                        imported_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     (
                         workspace_id,
                         cpn,
-                        canonical_desc,
-                        stock_total,
-                        json_dumps(alternates),
+                        str(getattr(cp, 'description', '') or ''),
+                        str(getattr(cp, 'default_whse', '') or ''),
+                        _as_float_or_none(getattr(cp, 'total_qty', None)),
+                        str(getattr(cp, 'revision', '') or ''),
+                        str(getattr(cp, 'primary_vendor_number', '') or ''),
+                        json_dumps(getattr(cp, 'raw_fields', {}) or {}),
+                        imported_at,
                         imported_at,
                     ),
                 )
-
-                # normalized view (blow away and rebuild rows for this cpn)
-                self.conn.execute(
-                    "DELETE FROM inventory_company_item WHERE workspace_id = ? AND cpn = ?;",
-                    (workspace_id, cpn),
-                )
-
-                for a in alternates:
-                    if not isinstance(a, dict):
-                        continue
-
-                    mpn = str(a.get("mpn") or a.get("mfgpn") or "").strip()
-                    if not mpn:
-                        continue
-
+                company_part_id = int(cur.lastrowid)
+                stats['company_parts'] += 1
+                for mp in (getattr(cp, 'manufacturer_parts', None) or []):
                     self.conn.execute(
                         """
-                        INSERT INTO inventory_company_item (
-                            workspace_id, cpn,
-                            mfgname, mfgid, mpn,
-                            unit_price, last_unit_price, standard_cost, average_cost,
-                            tariff_code, tariff_rate, supplier, lead_time_days,
-                            meta_json, imported_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(workspace_id, cpn, mfgname, mpn) DO UPDATE SET
-                            mfgid=excluded.mfgid,
-                            unit_price=excluded.unit_price,
-                            last_unit_price=excluded.last_unit_price,
-                            standard_cost=excluded.standard_cost,
-                            average_cost=excluded.average_cost,
-                            tariff_code=excluded.tariff_code,
-                            tariff_rate=excluded.tariff_rate,
-                            supplier=excluded.supplier,
-                            lead_time_days=excluded.lead_time_days,
-                            meta_json=excluded.meta_json,
-                            imported_at=excluded.imported_at;
+                        INSERT INTO manufacturer_part (
+                            workspace_id, company_part_id, manufacturer_part_number,
+                            manufacturer_id, manufacturer_name, description,
+                            active, item_lead_time, tariff_code, tariff_rate,
+                            last_cost, standard_cost, average_cost,
+                            is_erp_primary, erp_source_row_key, master_source_row_key,
+                            raw_json, imported_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """,
                         (
                             workspace_id,
-                            cpn,
-                            str(a.get("mfgname", "") or ""),
-                            str(a.get("mfgid", "") or ""),
-                            mpn,
-                            _as_float_or_none(a.get("unit_price")),
-                            _as_float_or_none(a.get("last_unit_price")),
-                            _as_float_or_none(a.get("standard_cost")),
-                            _as_float_or_none(a.get("average_cost")),
-                            str(a.get("tariff_code", "") or ""),
-                            _as_float_or_none(a.get("tariff_rate")),
-                            str(a.get("supplier", "") or ""),
-                            _as_int_or_none(a.get("lead_time_days")),
-                            json_dumps(a.get("meta", {}) or {}),
+                            company_part_id,
+                            str(getattr(mp, 'manufacturer_part_number', '') or ''),
+                            str(getattr(mp, 'manufacturer_id', '') or ''),
+                            str(getattr(mp, 'manufacturer_name', '') or ''),
+                            str(getattr(mp, 'description', '') or ''),
+                            str(getattr(mp, 'active', '') or ''),
+                            _as_float_or_none(getattr(mp, 'item_lead_time', None)),
+                            str(getattr(mp, 'tariff_code', '') or ''),
+                            _as_float_or_none(getattr(mp, 'tariff_rate', None)),
+                            _as_float_or_none(getattr(mp, 'last_cost', None)),
+                            _as_float_or_none(getattr(mp, 'standard_cost', None)),
+                            _as_float_or_none(getattr(mp, 'average_cost', None)),
+                            1 if bool(getattr(mp, 'is_erp_primary', False)) else 0,
+                            str(getattr(mp, 'erp_source_row_key', '') or ''),
+                            str(getattr(mp, 'master_source_row_key', '') or ''),
+                            json_dumps(getattr(mp, 'raw_fields', {}) or {}),
+                            imported_at,
                             imported_at,
                         ),
                     )
-
-
-    def sync_company_parts_incremental(
-        self,
-        workspace_id: str,
-        parts: Sequence[Dict[str, Any]],
-        *,
-        imported_at: Optional[str] = None,
-    ) -> Dict[str, int]:
-        """
-        Incrementally sync inventory_company / inventory_company_item for a workspace.
-
-        Behavior:
-        - Upserts only rows that are NEW or CHANGED (cpn-level diff on desc/stock/alternates_json)
-        - Leaves unchanged rows untouched (prevents write amplification / DB growth)
-        - Prunes CPN rows that no longer exist in the incoming master snapshot
-        - Rebuilds inventory_company_item ONLY for changed/new CPNs
-        """
-        imported_at = imported_at or _now_iso()
-
-        def _norm_alt(a: Dict[str, Any]) -> Dict[str, Any]:
-            if not isinstance(a, dict):
-                return {}
-            out = dict(a)
-            # normalize nested meta so JSON compare is stable
-            out["meta"] = out.get("meta", {}) or {}
-            return out
-
-        def _alts_json(v: Any) -> str:
-            alts = v or []
-            if not isinstance(alts, list):
-                alts = []
-            alts = [_norm_alt(a) for a in alts if isinstance(a, dict)]
-            return json.dumps(alts, sort_keys=True, separators=(",", ":"))
-
-        incoming: Dict[str, Dict[str, Any]] = {}
-        for p in (parts or []):
-            cpn = str((p or {}).get("cpn", "") or "").strip()
-            if not cpn:
-                continue
-            incoming[cpn] = {
-                "canonical_desc": str((p or {}).get("canonical_desc", "") or ""),
-                "stock_total": int((p or {}).get("stock_total", 0) or 0),
-                "alternates": ((p or {}).get("alternates") or (p or {}).get("alternates_json") or []),
-            }
-
-        stats = {"new": 0, "changed": 0, "unchanged": 0, "pruned": 0}
-
-        with _DB_LOCK, self.conn:
-            existing_rows = self.conn.execute(
-                "SELECT cpn, canonical_desc, stock_total, alternates_json FROM inventory_company WHERE workspace_id = ?;",
-                (workspace_id,),
-            ).fetchall()
-
-            existing_by_cpn = {}
-            for r in existing_rows:
-                d = dict(r)
-                existing_by_cpn[str(d.get("cpn") or "")] = {
-                    "canonical_desc": str(d.get("canonical_desc") or ""),
-                    "stock_total": int(d.get("stock_total") or 0),
-                    "alternates_json": d.get("alternates_json") or "[]",
-                }
-
-            incoming_cpns = set(incoming.keys())
-            existing_cpns = set(existing_by_cpn.keys())
-
-            # prune rows that no longer exist in the incoming master snapshot
-            stale_cpns = sorted(existing_cpns - incoming_cpns)
-            if stale_cpns:
-                qmarks = ",".join("?" for _ in stale_cpns)
-                self.conn.execute(
-                    f"DELETE FROM inventory_company_item WHERE workspace_id = ? AND cpn IN ({qmarks});",
-                    [workspace_id, *stale_cpns],
-                )
-                self.conn.execute(
-                    f"DELETE FROM inventory_company WHERE workspace_id = ? AND cpn IN ({qmarks});",
-                    [workspace_id, *stale_cpns],
-                )
-                stats["pruned"] = len(stale_cpns)
-
-            for cpn in sorted(incoming_cpns):
-                p = incoming[cpn]
-                canonical_desc = p["canonical_desc"]
-                stock_total = p["stock_total"]
-                alternates = p["alternates"] if isinstance(p["alternates"], list) else []
-                alt_json = _alts_json(alternates)
-
-                ex = existing_by_cpn.get(cpn)
-                changed = True
-                is_new = ex is None
-                if ex is not None:
-                    ex_alt_json = ex.get("alternates_json") or "[]"
-                    # compare canonical serialized forms to avoid whitespace/order noise
-                    try:
-                        ex_alt_json_cmp = json.dumps(json.loads(ex_alt_json), sort_keys=True, separators=(",", ":"))
-                    except Exception:
-                        ex_alt_json_cmp = ex_alt_json
-                    changed = not (
-                        ex.get("canonical_desc", "") == canonical_desc and
-                        int(ex.get("stock_total", 0)) == int(stock_total) and
-                        ex_alt_json_cmp == alt_json
-                    )
-
-                if not changed:
-                    stats["unchanged"] += 1
-                    continue
-
-                self.conn.execute(
-                    """
-                    INSERT INTO inventory_company (
-                        workspace_id, cpn,
-                        canonical_desc, stock_total,
-                        alternates_json,
-                        imported_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(workspace_id, cpn) DO UPDATE SET
-                        canonical_desc=excluded.canonical_desc,
-                        stock_total=excluded.stock_total,
-                        alternates_json=excluded.alternates_json,
-                        imported_at=excluded.imported_at;
-                    """,
-                    (workspace_id, cpn, canonical_desc, stock_total, alt_json, imported_at),
-                )
-
-                # rebuild normalized items only for this changed/new CPN
-                self.conn.execute(
-                    "DELETE FROM inventory_company_item WHERE workspace_id = ? AND cpn = ?;",
-                    (workspace_id, cpn),
-                )
-                for a in alternates:
-                    if not isinstance(a, dict):
-                        continue
-                    mpn = str(a.get("mpn") or a.get("mfgpn") or a.get("vendoritem") or "").strip()
-                    if not mpn:
-                        continue
-                    self.conn.execute(
-                        """
-                        INSERT INTO inventory_company_item (
-                            workspace_id, cpn,
-                            mfgname, mfgid, mpn,
-                            unit_price, last_unit_price, standard_cost, average_cost,
-                            tariff_code, tariff_rate, supplier, lead_time_days,
-                            meta_json, imported_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(workspace_id, cpn, mfgname, mpn) DO UPDATE SET
-                            mfgid=excluded.mfgid,
-                            unit_price=excluded.unit_price,
-                            last_unit_price=excluded.last_unit_price,
-                            standard_cost=excluded.standard_cost,
-                            average_cost=excluded.average_cost,
-                            tariff_code=excluded.tariff_code,
-                            tariff_rate=excluded.tariff_rate,
-                            supplier=excluded.supplier,
-                            lead_time_days=excluded.lead_time_days,
-                            meta_json=excluded.meta_json,
-                            imported_at=excluded.imported_at;
-                        """,
-                        (
-                            workspace_id,
-                            cpn,
-                            str(a.get("mfgname", "") or ""),
-                            str(a.get("mfgid", "") or ""),
-                            mpn,
-                            _as_float_or_none(a.get("unit_price")),
-                            _as_float_or_none(a.get("last_unit_price")),
-                            _as_float_or_none(a.get("standard_cost")),
-                            _as_float_or_none(a.get("average_cost")),
-                            str(a.get("tariff_code", "") or ""),
-                            _as_float_or_none(a.get("tariff_rate")),
-                            str(a.get("supplier", "") or ""),
-                            _as_int_or_none(a.get("lead_time_days")),
-                            json_dumps(a.get("meta", {}) or {}),
-                            imported_at,
-                        ),
-                    )
-
-                if is_new:
-                    stats["new"] += 1
-                else:
-                    stats["changed"] += 1
-
+                    stats['manufacturer_parts'] += 1
         return stats
 
-    def get(self, workspace_id: str, cpn: str) -> Optional[Dict[str, Any]]:
-        row = self.conn.execute(
-            """
-            SELECT *
-            FROM inventory_company
-            WHERE workspace_id = ? AND cpn = ?;
-            """,
-            (workspace_id, str(cpn or "")),
-        ).fetchone()
 
-        if not row:
-            return None
-
-        d = dict(row)
-        d["alternates_json"] = json_loads(d.get("alternates_json"), default=[])
-        return d
-
-    def list(self, workspace_id: str) -> List[Dict[str, Any]]:
-        rows = self.conn.execute(
-            """
-            SELECT *
-            FROM inventory_company
-            WHERE workspace_id = ?
-            ORDER BY cpn ASC;
-            """,
-            (workspace_id,),
-        ).fetchall()
-
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            d = dict(r)
-            d["alternates_json"] = json_loads(d.get("alternates_json"), default=[])
-            out.append(d)
-        return out
-
-
-class InventoryCompanyItemRepo:
+class ManufacturerPartRepo:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
-    def list_for_cpn(self, workspace_id: str, cpn: str) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _row_to_manufacturer(row: sqlite3.Row) -> ManufacturerPartRecord:
+        return ManufacturerPartRecord(
+            manufacturer_part_id=row['manufacturer_part_id'],
+            company_part_id=row['company_part_id'],
+            company_part_number=str(row['company_part_number']) if 'company_part_number' in row.keys() else '',
+            manufacturer_part_number=str(row['manufacturer_part_number'] or ''),
+            manufacturer_id=str(row['manufacturer_id'] or ''),
+            manufacturer_name=str(row['manufacturer_name'] or ''),
+            description=str(row['description'] or ''),
+            active=str(row['active'] or ''),
+            item_lead_time=_as_float_or_none(row['item_lead_time']),
+            tariff_code=str(row['tariff_code'] or ''),
+            tariff_rate=_as_float_or_none(row['tariff_rate']),
+            last_cost=_as_float_or_none(row['last_cost']),
+            standard_cost=_as_float_or_none(row['standard_cost']),
+            average_cost=_as_float_or_none(row['average_cost']),
+            is_erp_primary=bool(row['is_erp_primary']),
+            erp_source_row_key=str(row['erp_source_row_key'] or ''),
+            master_source_row_key=str(row['master_source_row_key'] or ''),
+            updated_at=str(row['updated_at'] or ''),
+            last_seen_at=str(row['imported_at'] or ''),
+            raw_fields=json_loads(row['raw_json'], default={}),
+        )
+
+    def list_for_company_part_id(self, workspace_id: str, company_part_id: Optional[int]) -> List[ManufacturerPartRecord]:
+        if company_part_id is None:
+            return []
         rows = self.conn.execute(
             """
-            SELECT *
-            FROM inventory_company_item
-            WHERE workspace_id = ? AND cpn = ?
-            ORDER BY mfgname ASC, mpn ASC;
+            SELECT mp.*, cp.company_part_number
+            FROM manufacturer_part mp
+            JOIN company_part cp ON cp.company_part_id = mp.company_part_id
+            WHERE mp.workspace_id = ? AND mp.company_part_id = ?
+            ORDER BY mp.is_erp_primary DESC, mp.manufacturer_name ASC, mp.manufacturer_part_number ASC;
             """,
-            (workspace_id, str(cpn or "")),
+            (workspace_id, int(company_part_id)),
         ).fetchall()
+        return [self._row_to_manufacturer(r) for r in rows]
 
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            d = dict(r)
-            d["meta_json"] = json_loads(d.get("meta_json"), default={})
-            out.append(d)
-        return out
+    def list_for_cpn(self, workspace_id: str, company_part_number: str) -> List[ManufacturerPartRecord]:
+        rows = self.conn.execute(
+            """
+            SELECT mp.*, cp.company_part_number
+            FROM manufacturer_part mp
+            JOIN company_part cp ON cp.company_part_id = mp.company_part_id
+            WHERE cp.workspace_id = ? AND cp.company_part_number = ?
+            ORDER BY mp.is_erp_primary DESC, mp.manufacturer_name ASC, mp.manufacturer_part_number ASC;
+            """,
+            (workspace_id, str(company_part_number or '')),
+        ).fetchall()
+        return [self._row_to_manufacturer(r) for r in rows]
+
+
+class InventoryImportRepo:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+        self.company_parts = CompanyPartRepo(conn)
+
+    def replace_inventory_snapshot(
+        self,
+        workspace_id: str,
+        *,
+        erp_rows: Sequence[Dict[str, Any]] | None = None,
+        master_rows: Sequence[Dict[str, Any]] | None = None,
+        company_parts: Sequence[CompanyPartRecord] | None = None,
+        imported_at: Optional[str] = None,
+    ) -> Dict[str, int]:
+        imported_at = imported_at or _now_iso()
+        erp_rows = list(erp_rows or [])
+        master_rows = list(master_rows or [])
+        company_parts = list(company_parts or [])
+        with _DB_LOCK, self.conn:
+            self.conn.execute('DELETE FROM erp_inventory_raw WHERE workspace_id = ?;', (workspace_id,))
+            self.conn.execute('DELETE FROM alternate_master_raw WHERE workspace_id = ?;', (workspace_id,))
+            for row in erp_rows:
+                self.conn.execute(
+                    """
+                    INSERT INTO erp_inventory_raw (
+                        workspace_id, source_row_key, item_number, description,
+                        primary_vendor_number, vendor_item, manufacturer_id,
+                        manufacturer_name, manufacturer_item_count, last_cost,
+                        standard_cost, average_cost, revision, item_lead_time,
+                        default_whse, total_qty, raw_json, imported_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        workspace_id,
+                        str(row.get('source_row_key', '') or ''),
+                        str(row.get('item_number', '') or ''),
+                        str(row.get('description', '') or ''),
+                        str(row.get('primary_vendor_number', '') or ''),
+                        str(row.get('vendor_item', '') or ''),
+                        str(row.get('manufacturer_id', '') or ''),
+                        str(row.get('manufacturer_name', '') or ''),
+                        _as_float_or_none(row.get('manufacturer_item_count')),
+                        _as_float_or_none(row.get('last_cost')),
+                        _as_float_or_none(row.get('standard_cost')),
+                        _as_float_or_none(row.get('average_cost')),
+                        str(row.get('revision', '') or ''),
+                        _as_float_or_none(row.get('item_lead_time')),
+                        str(row.get('default_whse', '') or ''),
+                        _as_float_or_none(row.get('total_qty')),
+                        json_dumps(row.get('raw_fields', {}) or row),
+                        imported_at,
+                    ),
+                )
+            for row in master_rows:
+                self.conn.execute(
+                    """
+                    INSERT INTO alternate_master_raw (
+                        workspace_id, source_row_key, item_number, description,
+                        active, manufacturer_id, manufacturer_name,
+                        manufacturer_part_number, tariff_code, tariff_rate,
+                        last_cost, standard_cost, average_cost, raw_json, imported_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        workspace_id,
+                        str(row.get('source_row_key', '') or ''),
+                        str(row.get('item_number', '') or ''),
+                        str(row.get('description', '') or ''),
+                        str(row.get('active', '') or ''),
+                        str(row.get('manufacturer_id', '') or ''),
+                        str(row.get('manufacturer_name', '') or ''),
+                        str(row.get('manufacturer_part_number', '') or ''),
+                        str(row.get('tariff_code', '') or ''),
+                        _as_float_or_none(row.get('tariff_rate')),
+                        _as_float_or_none(row.get('last_cost')),
+                        _as_float_or_none(row.get('standard_cost')),
+                        _as_float_or_none(row.get('average_cost')),
+                        json_dumps(row.get('raw_fields', {}) or row),
+                        imported_at,
+                    ),
+                )
+        stats = self.company_parts.replace_for_workspace(workspace_id, company_parts, imported_at=imported_at)
+        stats.update({'erp_rows': len(erp_rows), 'master_rows': len(master_rows)})
+        return stats
+
 
 
 # =============================================================================
@@ -1469,3 +1430,72 @@ class SpladeCacheRepo:
                     (model_name, int(preprocess_version), int(max_len), int(top_terms)),
                 )
         return int(getattr(cur, "rowcount", 0) or 0)
+
+
+# =============================================================================
+# Runtime hydration helpers for matching/UI compatibility
+# =============================================================================
+def build_runtime_inventory_part(company_part: CompanyPartRecord, manufacturer_part: ManufacturerPartRecord) -> InventoryPart:
+    """Flatten canonical inventory records into the runtime object expected by matching/UI code."""
+    raw = dict(company_part.raw_fields or {})
+    raw.update(manufacturer_part.raw_fields or {})
+    raw.setdefault("totalqty", company_part.total_qty)
+    raw.setdefault("total_qty", company_part.total_qty)
+    raw.setdefault("company_part_number", company_part.company_part_number)
+    return InventoryPart(
+        itemnum=str(company_part.company_part_number or ""),
+        desc=str(manufacturer_part.description or company_part.description or ""),
+        mfgid=str(manufacturer_part.manufacturer_id or ""),
+        mfgname=str(manufacturer_part.manufacturer_name or ""),
+        vendoritem=str(manufacturer_part.manufacturer_part_number or ""),
+        supplier=str(company_part.primary_vendor_number or ""),
+        stock=_as_int_or_none(company_part.total_qty) or 0,
+        lead_time_days=_as_int_or_none(manufacturer_part.item_lead_time),
+        raw_fields=raw,
+    )
+
+
+def match_result_to_dict(match: MatchResult) -> Dict[str, Any]:
+    """Serialize a MatchResult into a plain dictionary for DB logging/debug storage."""
+    inv = match.inventory_part
+    return {
+        "match_type": match.match_type.value if hasattr(match.match_type, "value") else str(match.match_type or ""),
+        "confidence": float(match.confidence or 0.0),
+        "notes": str(match.notes or ""),
+        "explain": dict(match.explain or {}),
+        "inventory_part": inv.to_dict() if hasattr(inv, "to_dict") and inv is not None else None,
+        "candidate_count": len(match.candidates or []),
+    }
+
+
+def match_result_from_dict(payload: Dict[str, Any]) -> MatchResult:
+    """Rehydrate a minimal MatchResult from a stored dictionary payload."""
+    payload = payload or {}
+    inv_payload = payload.get("inventory_part") or None
+    inv = None
+    if isinstance(inv_payload, dict):
+        inv = InventoryPart(
+            itemnum=str(inv_payload.get("itemnum", "") or ""),
+            desc=str(inv_payload.get("description", inv_payload.get("desc", "")) or ""),
+            mfgid=str(inv_payload.get("mfgid", "") or ""),
+            mfgname=str(inv_payload.get("mfgname", "") or ""),
+            vendoritem=str(inv_payload.get("vendoritem", "") or ""),
+            supplier=str(inv_payload.get("supplier", "") or ""),
+            stock=_as_int_or_none(inv_payload.get("stock")) or 0,
+            lead_time_days=_as_int_or_none(inv_payload.get("lead_time_days")),
+            raw_fields=dict(inv_payload.get("raw_fields") or {}),
+            parsed=dict(inv_payload.get("parsed") or {}),
+        )
+    mt_raw = str(payload.get("match_type", "") or "")
+    try:
+        mt = next(m for m in MatchType if m.value == mt_raw)
+    except StopIteration:
+        mt = MatchType.NO_MATCH
+    return MatchResult(
+        match_type=mt,
+        confidence=float(payload.get("confidence", 0.0) or 0.0),
+        inventory_part=inv,
+        candidates=[inv] if inv is not None else [],
+        notes=str(payload.get("notes", "") or ""),
+        explain=dict(payload.get("explain") or {}),
+    )
